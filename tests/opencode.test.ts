@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { resolve } from "node:path";
 import type { OpenCodeEvent, SessionMessageInfo } from "@opencode/client";
 import type { Plugin } from "@opencode/plugin/tui";
 import { createPlugin } from "../src/opencode/index.js";
@@ -55,6 +56,32 @@ function message(overrides: Partial<Extract<SessionMessageInfo, { type: "assista
     ], ...overrides };
 }
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test("backend configuration selects Python and is sent with speech", async () => {
+  const python = resolve("chatterbox-python");
+  const referenceAudio = resolve("reference.wav");
+  const f = fixture({ backend: "chatterbox-nano", chatterboxPython: python, referenceAudio });
+  assert.equal(f.callbacks()?.python, python);
+  f.setMessages([message()]); f.start(); f.step(); f.success(); await tick();
+  const request = f.sent[0];
+  assert.equal(request.type, "speak");
+  if (request.type === "speak") assert.deepEqual(request.config, { voice: "af_heart", speed: 1, backend: "chatterbox-nano", referenceAudio });
+  f.callbacks()?.onDiagnostic?.("GPU failed; retrying on CPU");
+  assert.equal(f.toasts.at(-1), "GPU failed; retrying on CPU");
+  f.cleanup?.();
+});
+
+test("invalid backend paths and names report actionable errors", () => {
+  for (const [options, expected] of [
+    [{ backend: "other" }, "Invalid backend: choose kokoro, chatterbox-nano, or chatterbox-turbo"],
+    [{ referenceAudio: "relative.wav" }, "referenceAudio must be an absolute path"],
+    [{ chatterboxPython: "python" }, "chatterboxPython must be an absolute path"],
+  ] as const) {
+    const f = fixture(options);
+    assert.deepEqual(f.toasts, [expected]);
+    assert.equal(f.callbacks(), undefined);
+  }
+});
 
 test("selects only the exact final completed answer and deduplicates success", async () => {
   const f = fixture(); f.setMessages([message(), message({ id: "older", content: [{ type: "text", text: "old" }] })]);

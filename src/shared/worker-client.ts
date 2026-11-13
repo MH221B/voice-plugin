@@ -1,12 +1,13 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { WorkerRequest, WorkerResponse } from "./types.js";
 
-type Terminal = Exclude<WorkerResponse, { type: "ready" }>;
+type Terminal = Exclude<WorkerResponse, { type: "ready" | "diagnostic" }>;
 type Options = {
   python: string;
   projectRoot: string;
   onTerminal: (sessionId: string, id: string, response: Terminal) => void;
   onFailure: (message: string) => void;
+  onDiagnostic?: (message: string) => void;
   spawn?: typeof spawn;
 };
 
@@ -19,9 +20,12 @@ export class WorkerClient {
   private pending = new Map<string, string>();
 
   constructor(private options: Options) {
+    const token = process.env.HF_TOKEN?.trim();
     this.child = (options.spawn ?? spawn)(options.python, ["-m", "worker.main"], {
       cwd: options.projectRoot,
       stdio: "pipe",
+      env: { ...process.env, HF_TOKEN: token || undefined, HF_OIDC_RESOURCE: undefined,
+        HF_HUB_DISABLE_IMPLICIT_TOKEN: token ? "0" : "1" },
     }) as ChildProcessWithoutNullStreams;
     this.child.stdout.setEncoding("utf8");
     this.child.stdout.on("data", this.onData);
@@ -75,6 +79,8 @@ export class WorkerClient {
         const queue = this.queue;
         this.queue = [];
         for (const request of queue) if (!this.write(request)) break;
+      } else if (value.type === "diagnostic" && typeof value.id === "string" && typeof value.message === "string") {
+        if (this.pending.has(value.id)) this.options.onDiagnostic?.(value.message);
       } else if ((value.type === "done" || value.type === "cancelled") && typeof value.id === "string") {
         this.terminal(value.id, value as Terminal);
       } else if (value.type === "error" && typeof value.message === "string" && (value.id === undefined || typeof value.id === "string")) {

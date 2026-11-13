@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "voice-plugin"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
+# Chatterbox is installed separately; see README.md for its pinned source revision.
 dependencies = ["kokoro==0.9.4", "sounddevice==0.5.6"]
 
 [tool.setuptools]

@@ -198,3 +198,167 @@ class WorkerTests(unittest.TestCase):
         self.start(lambda language: lambda text, **kwargs: [(None, None, [0])], fail)
         self.input.send(speak("device"))
         self.assertEqual(self.output.queue.get(timeout=2), {"type": "error", "id": "device", "message": "device failed"})
+
+    def test_chatterbox_synthesizes_next_unit_during_playback(self):
+        playing, second_ready, release = threading.Event(), threading.Event(), threading.Event()
+
+        class FakeBackend:
+            def __init__(self, nano, diagnostic):
+                pass
+
+            def synthesize(self, text, reference):
+                if text == "second":
+                    self.assert_playing = playing.wait(2)
+                    if self.assert_playing:
+                        second_ready.set()
+                return [text], 24000
+
+        class BlockingAudio(Audio):
+            def write(self, samples):
+                if samples == ["first"]:
+                    playing.set()
+                    release.wait(3)
+                super().write(samples)
+
+        with patch("worker.chatterbox_backend.ChatterboxBackend", FakeBackend):
+            self.start(lambda language: None, lambda rate: BlockingAudio(self.writes))
+            request = speak("overlap", ("first", "second"))
+            request["config"]["backend"] = "chatterbox-turbo"
+            self.input.send(request)
+            try:
+                self.assertTrue(playing.wait(2))
+                self.assertTrue(second_ready.wait(2), "next sentence was not synthesized during playback")
+            finally:
+                release.set()
+            self.result("done", "overlap")
+            self.assertEqual(self.writes, [["first"], ["second"]])
+
+    def test_chatterbox_cancel_discards_prefetched_audio(self):
+        playing, prefetched = threading.Event(), threading.Event()
+
+        class FakeBackend:
+            def __init__(self, nano, diagnostic):
+                pass
+
+            def synthesize(self, text, reference):
+                if text == "second":
+                    playing.wait(2)
+                    prefetched.set()
+                return [text], 24000
+
+        class BlockingAudio(Audio):
+            def write(self, samples):
+                playing.set()
+                self.aborted.wait(3)
+                if not self.aborted.is_set():
+                    super().write(samples)
+
+        audio = BlockingAudio(self.writes)
+        with patch("worker.chatterbox_backend.ChatterboxBackend", FakeBackend):
+            self.start(lambda language: None, lambda rate: audio)
+            request = speak("cancel-prefetch", ("first", "second"))
+            request["config"]["backend"] = "chatterbox-turbo"
+            self.input.send(request)
+            self.assertTrue(prefetched.wait(2))
+            self.input.send({"type": "cancel", "id": "cancel-prefetch"})
+            self.result("cancelled", "cancel-prefetch")
+            self.assertTrue(audio.aborted.is_set())
+            self.assertEqual(self.writes, [])
+
+    def test_chatterbox_rate_selection_and_diagnostic(self):
+        import numpy as np
+        rates, calls = [], []
+        class FakeBackend:
+            def __init__(self, nano, diagnostic):
+                calls.append(nano)
+                self.diagnostic = diagnostic
+            def synthesize(self, text, reference):
+                self.diagnostic("GPU failed; retrying on CPU")
+                return np.array([0.25, 0.5], dtype=np.float32), 22050
+        def stream(rate):
+            rates.append(rate)
+            return Audio(self.writes)
+        with patch("worker.chatterbox_backend.ChatterboxBackend", FakeBackend):
+            self.start(lambda language: self.fail("Kokoro must not load"), stream)
+            request = speak("nano")
+            request["config"]["backend"] = "chatterbox-nano"
+            self.input.send(request)
+            self.assertEqual(self.output.queue.get(timeout=3), {"type": "diagnostic", "id": "nano", "message": "GPU failed; retrying on CPU"})
+            self.result("done", "nano")
+        self.assertEqual(calls, [True])
+        self.assertEqual(rates, [22050])
+        np.testing.assert_array_equal(self.writes[0], [0.25, 0.5])
+
+    def test_chatterbox_cancel_during_synthesis_suppresses_output(self):
+        import numpy as np
+        entered, release = threading.Event(), threading.Event()
+        class FakeBackend:
+            def __init__(self, nano, diagnostic):
+                self.diagnostic = diagnostic
+            def synthesize(self, text, reference):
+                entered.set()
+                release.wait(3)
+                self.diagnostic("stale")
+                return np.array([1], dtype=np.float32), 16000
+        with patch("worker.chatterbox_backend.ChatterboxBackend", FakeBackend):
+            self.start(lambda language: self.fail("Kokoro must not load"), lambda rate: Audio(self.writes))
+            request = speak("cancelled")
+            request["config"]["backend"] = "chatterbox-turbo"
+            self.input.send(request)
+            self.assertTrue(entered.wait(2))
+            self.input.send({"type": "cancel", "id": "cancelled"})
+            self.result("cancelled", "cancelled")
+            release.set()
+            self.input.send(speak("next"))
+            self.assertEqual(self.output.queue.get(timeout=3)["type"], "error")
+            self.assertEqual(self.writes, [])
+            self.assertTrue(self.output.queue.empty())
+
+    def test_backend_and_reference_validation(self):
+        self.start(lambda language: lambda text, **kwargs: [(None, None, [0])])
+        for request_id, config, message in (
+            ("bad-backend", {"backend": "other"}, "invalid backend"),
+            ("bad-reference", {"backend": "chatterbox-nano", "referenceAudio": "relative.wav"}, "referenceAudio must be an absolute path"),
+        ):
+            request = speak(request_id)
+            request["config"].update(config)
+            self.input.send(request)
+            response = self.output.queue.get(timeout=3)
+            self.assertEqual(response["type"], "error")
+            self.assertEqual(response["id"], request_id)
+            self.assertIn(message, response["message"])
+        self.input.send(speak("default"))
+        self.result("done", "default")
+
+    def test_cancel_during_gpu_failure_does_not_load_cpu(self):
+        import numpy as np
+        entered, release = threading.Event(), threading.Event()
+        loads = []
+        class Model:
+            conds = object()
+            sr = 24000
+            tokenizer = staticmethod(lambda text, **kwargs: {"input_ids": list(text)})
+            def generate(self, text, audio_prompt_path=None):
+                entered.set()
+                release.wait(3)
+                raise RuntimeError("GPU failed")
+        def load(**kwargs):
+            loads.append(kwargs["device"])
+            return Model()
+        modules = {"torch": types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: True)),
+                   "chatterbox": types.ModuleType("chatterbox"),
+                   "chatterbox.tts_turbo": types.SimpleNamespace(ChatterboxTurboTTS=types.SimpleNamespace(from_pretrained=load))}
+        with patch.dict(sys.modules, modules):
+            self.start(lambda language: lambda text, **kwargs: [(None, None, [0])], lambda rate=24000: Audio(self.writes))
+            request = speak("active")
+            request["config"]["backend"] = "chatterbox-nano"
+            self.input.send(request)
+            self.assertTrue(entered.wait(2))
+            self.input.send({"type": "cancel", "id": "active"})
+            self.result("cancelled", "active")
+            release.set()
+            self.input.send(speak("next"))
+            self.result("done", "next")
+            self.assertEqual(loads, ["cuda"])
+            np.testing.assert_array_equal(self.writes[0], [0])
+            self.assertTrue(self.output.queue.empty())

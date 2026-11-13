@@ -21,20 +21,38 @@ function fixture() {
   const child = new FakeChild();
   const terminal: [string, string, WorkerResponse][] = [];
   const failures: string[] = [];
+  const diagnostics: string[] = [];
   let args: unknown[] = [];
   const client = new WorkerClient({ python: "absolute-python", projectRoot: "absolute-root",
     spawn: ((...values: unknown[]) => { args = values; return child; }) as unknown as typeof spawn,
     onTerminal: (session, id, response) => terminal.push([session, id, response]),
     onFailure: (message) => failures.push(message),
+    onDiagnostic: (message) => diagnostics.push(message),
   });
   const speak = (id: string, sessionId = "session"): WorkerRequest => ({ type: "speak", id, sessionId,
     units: [{ text: "Hello", emotions: {}, boundary: "sentence" }], config: { voice: "af_heart", speed: 1 } });
-  return { child, client, terminal, failures, speak, args };
+  return { child, client, terminal, failures, diagnostics, speak, args };
 }
+
+test("diagnostics are nonterminal and stale diagnostics are ignored", () => {
+  const { child, client, terminal, failures, diagnostics, speak } = fixture();
+  client.send(speak("a"));
+  child.stdout.write('{"type":"ready"}\n');
+  child.stdout.write('{"type":"diagnostic","id":"a","message":"CPU fallback"}\n');
+  assert.deepEqual(diagnostics, ["CPU fallback"]);
+  assert.deepEqual(terminal, []);
+  child.stdout.write('{"type":"done","id":"a"}\n');
+  child.stdout.write('{"type":"diagnostic","id":"a","message":"stale"}\n');
+  assert.equal(terminal.length, 1);
+  assert.deepEqual(diagnostics, ["CPU fallback"]);
+  assert.deepEqual(failures, []);
+  client.dispose();
+});
 
 test("buffers until readiness, parses split lines and routes terminal responses once", () => {
   const { child, client, terminal, failures, speak, args } = fixture();
-  assert.deepEqual(args, ["absolute-python", ["-m", "worker.main"], { cwd: "absolute-root", stdio: "pipe" }]);
+  assert.deepEqual(args.slice(0, 2), ["absolute-python", ["-m", "worker.main"]]);
+  assert.equal((args[2] as { cwd: string }).cwd, "absolute-root");
   assert.equal(client.send(speak("a", "one")), true);
   assert.equal(client.send(speak("b", "two")), true);
   assert.equal(child.writes.length, 0);
@@ -46,6 +64,29 @@ test("buffers until readiness, parses split lines and routes terminal responses 
     ["two", "b", { type: "error", id: "b", message: "device" }]]);
   assert.deepEqual(failures, []);
   client.dispose(); assert.equal(child.killed, true);
+});
+
+test("worker uses only a nonblank HF_TOKEN for Hub authentication", () => {
+  const original = { ...process.env };
+  try {
+    process.env.HF_OIDC_RESOURCE = "other-auth";
+    process.env.HF_HUB_DISABLE_IMPLICIT_TOKEN = "1";
+    for (const token of [undefined, "", "   ", " test-token "]) {
+      if (token === undefined) delete process.env.HF_TOKEN;
+      else process.env.HF_TOKEN = token;
+      const { args, client } = fixture();
+      const env = (args[2] as { env: NodeJS.ProcessEnv }).env;
+      assert.equal(env.HF_TOKEN, token?.trim() || undefined);
+      assert.equal(env.HF_HUB_DISABLE_IMPLICIT_TOKEN, token?.trim() ? "0" : "1");
+      assert.equal(env.HF_OIDC_RESOURCE, undefined);
+      client.dispose();
+    }
+  } finally {
+    for (const key of ["HF_TOKEN", "HF_OIDC_RESOURCE", "HF_HUB_DISABLE_IMPLICIT_TOKEN"]) {
+      if (original[key] === undefined) delete process.env[key];
+      else process.env[key] = original[key];
+    }
+  }
 });
 
 test("malformed output and exits fail all requests with one process notification", () => {

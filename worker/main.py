@@ -12,14 +12,20 @@ def pipeline_factory(language):
     return KPipeline(lang_code=language)
 
 
-def stream_factory():
+def stream_factory(samplerate=24000):
     import sounddevice
-    return sounddevice.OutputStream(samplerate=24000, channels=1, dtype="float32")
+    return sounddevice.OutputStream(samplerate=samplerate, channels=1, dtype="float32")
 
 
 def prepare_runtime():
     # NumPy's Windows native import can stall when first loaded on the playback thread.
     import numpy  # noqa: F401
+
+    # Chatterbox's native imports can also stall on that thread on Windows.
+    if sys.platform == "win32":
+        import importlib.util
+        if importlib.util.find_spec("chatterbox") is not None:
+            from chatterbox import tts_turbo  # noqa: F401
 
     if sys.platform == "win32" and "PHONEMIZER_ESPEAK_LIBRARY" not in os.environ:
         try:
@@ -38,6 +44,7 @@ class Worker:
         self.pipeline_factory = pipeline_factory
         self.stream_factory = stream_factory
         self.pipelines = {}
+        self.chatterboxes = {}
         self.lock = threading.RLock()
         self.pending = {}
         self.seen = set()
@@ -91,6 +98,12 @@ class Worker:
             config = request.get("config")
             if not isinstance(config, dict):
                 raise ValueError("invalid config")
+            backend = config.get("backend", "kokoro")
+            if backend not in ("kokoro", "chatterbox-nano", "chatterbox-turbo"):
+                raise ValueError("invalid backend: choose kokoro, chatterbox-nano, or chatterbox-turbo")
+            reference = config.get("referenceAudio")
+            if reference is not None and (not isinstance(reference, str) or not os.path.isabs(reference)):
+                raise ValueError("referenceAudio must be an absolute path")
             units = request.get("units")
             if not isinstance(units, list):
                 raise ValueError("invalid units")
@@ -122,6 +135,9 @@ class Worker:
             if request_id not in self.pending:
                 return
             self.active = request_id
+        if request["config"].get("backend", "kokoro") != "kokoro":
+            self.play_chatterbox(request)
+            return
         stream = None
         try:
             config = request["config"]
@@ -136,7 +152,8 @@ class Worker:
                 with self.lock:
                     if request_id not in self.pending:
                         return
-                for _, _, audio in self.pipelines[language](unit["text"], voice=voice, speed=speed):
+                chunks = (audio for _, _, audio in self.pipelines[language](unit["text"], voice=voice, speed=speed))
+                for audio in chunks:
                     with self.lock:
                         if request_id not in self.pending:
                             return
@@ -166,6 +183,93 @@ class Worker:
                     stream.close()
                 except Exception:
                     pass
+
+    def play_chatterbox(self, request):
+        request_id = request["id"]
+        config = request["config"]
+        backend = config["backend"]
+        audio_queue = queue.Queue(maxsize=1)
+        finished = threading.Event()
+        errors = []
+
+        def cancelled():
+            with self.lock:
+                return request_id not in self.pending
+
+        def diagnostic(message):
+            with self.lock:
+                if request_id in self.pending:
+                    self.emit({"type": "diagnostic", "id": request_id, "message": message})
+
+        def playback():
+            stream = None
+            rate = None
+            try:
+                while not cancelled():
+                    try:
+                        audio, current_rate = audio_queue.get(timeout=0.05)
+                    except queue.Empty:
+                        if finished.is_set():
+                            break
+                        continue
+                    with self.lock:
+                        if request_id not in self.pending:
+                            return
+                        if stream is None:
+                            rate = current_rate
+                            stream = self.stream_factory(rate)
+                            self.stream = stream
+                            stream.start()
+                    if rate != current_rate:
+                        raise ValueError("Chatterbox sample rate changed within a request")
+                    for offset in range(0, len(audio), 1200):
+                        if cancelled():
+                            return
+                        stream.write(audio[offset:offset + 1200])
+                if stream is not None and not cancelled():
+                    stream.stop()
+            except Exception as exc:
+                errors.append(exc)
+                finished.set()
+            finally:
+                with self.lock:
+                    self.stream = None
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+
+        thread = threading.Thread(target=playback)
+        thread.start()
+        try:
+            from worker.chatterbox_backend import ChatterboxBackend
+            if backend not in self.chatterboxes:
+                self.chatterboxes[backend] = ChatterboxBackend(backend == "chatterbox-nano", diagnostic)
+            adapter = self.chatterboxes[backend]
+            adapter.cancelled = cancelled
+            adapter.diagnostic = diagnostic
+            for unit in request["units"]:
+                if cancelled() or finished.is_set():
+                    break
+                audio, rate = adapter.synthesize(unit["text"], config.get("referenceAudio"))
+                while not cancelled() and not finished.is_set():
+                    try:
+                        audio_queue.put((audio, rate), timeout=0.05)
+                        break
+                    except queue.Full:
+                        continue
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+            thread.join()
+            with self.lock:
+                self.active = None
+            if errors:
+                self.terminal(request_id, "error", str(errors[0]) or type(errors[0]).__name__)
+            else:
+                self.terminal(request_id, "done")
 
     def run(self, input_stream):
         def playback():

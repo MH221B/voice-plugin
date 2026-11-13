@@ -19,6 +19,21 @@ return Plugin.define({
     const python = options.python ?? (typeof root === "string" ? join(root, ".venv", "Scripts", "python.exe") : "");
     const voice = options.voice ?? "af_heart";
     const speed = options.speed ?? 1;
+    const backend = options.backend ?? "kokoro";
+    const referenceAudio = options.referenceAudio;
+    const chatterboxPython = options.chatterboxPython;
+    if (backend !== "kokoro" && backend !== "chatterbox-nano" && backend !== "chatterbox-turbo") {
+      toast("Invalid backend: choose kokoro, chatterbox-nano, or chatterbox-turbo");
+      return;
+    }
+    if (referenceAudio !== undefined && (typeof referenceAudio !== "string" || !isAbsolute(referenceAudio))) {
+      toast("referenceAudio must be an absolute path");
+      return;
+    }
+    if (chatterboxPython !== undefined && (typeof chatterboxPython !== "string" || !isAbsolute(chatterboxPython))) {
+      toast("chatterboxPython must be an absolute path");
+      return;
+    }
     if (typeof root !== "string" || !isAbsolute(root) || typeof python !== "string" || !isAbsolute(python) ||
         typeof voice !== "string" || !/^(af_|am_|bf_|bm_)\S+$/.test(voice) ||
         typeof speed !== "number" || !Number.isFinite(speed) || speed < 0.7 || speed > 1.3) {
@@ -28,11 +43,12 @@ return Plugin.define({
     let playback: SessionPlayback;
     let client: Client;
     try {
-      client = makeClient({ python, projectRoot: root,
+      client = makeClient({ python: backend === "kokoro" ? python : (chatterboxPython ?? python), projectRoot: root,
         onTerminal: (session, id, response) => playback.finished(session, id, response),
         onFailure: (message) => toast(message),
+        onDiagnostic: (message) => toast(message),
       });
-      playback = new SessionPlayback(client, { voice, speed }, (_session, message) => toast(message));
+      playback = new SessionPlayback(client, { voice, speed, backend, ...(referenceAudio === undefined ? {} : { referenceAudio }) }, (_session, message) => toast(message));
     } catch (error) {
       toast(`Voice worker failed: ${String(error)}`);
       return;

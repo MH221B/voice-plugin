@@ -5,7 +5,7 @@ export type SpeechUnit = {
   emotions: Emotions;
   boundary: "sentence" | "span";
 };
-export type VoiceConfig = { voice: string; speed: number };
+export type VoiceConfig = { voice: string; speed: number; backend?: "kokoro" | "chatterbox-nano" | "chatterbox-turbo"; referenceAudio?: string };
 export type CompletedAnswer = { sessionId: string; answerId: string; text: string };
 
 export type WorkerRequest =
@@ -16,4 +16,5 @@ export type WorkerResponse =
   | { type: "ready" }
   | { type: "done"; id: string }
   | { type: "cancelled"; id: string }
+  | { type: "diagnostic"; id: string; message: string }
   | { type: "error"; id?: string; message: string };

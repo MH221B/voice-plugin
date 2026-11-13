@@ -62,3 +62,9 @@ test("closed and unclosed fences preserve surrounding prose", () => {
     { text: "Before After", emotions: {}, boundary: "sentence" },
   ]);
 });
+
+test("native tags survive Markdown and voice span parsing", () => {
+  const units = parseReply('**Hello** [laugh] [voice emotions="sad:1"]Oh [cough].[/voice] [chuckle] [link](https://example.com)');
+  assert.deepEqual(units.map((unit) => unit.text), ["Hello [laugh]", "Oh [cough].", "[chuckle] link"]);
+  assert.deepEqual(units[1].emotions, { sad: 1 });
+});

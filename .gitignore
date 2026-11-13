@@ -1,5 +1,8 @@
 node_modules/
 .venv/
+.venv-chatterbox/
+.venv-chatterbox-amd/
+.voice-cache/
 venv/
 __pycache__/
 *.py[cod]
