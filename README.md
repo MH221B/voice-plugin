@@ -83,7 +83,15 @@ The first use of a reference saves voice conditioning in `.voice-cache`, which i
 
 The worker tries a PyTorch `cuda` device when available, including compatible AMD ROCm runtimes, and falls back to CPU with a diagnostic if GPU loading or synthesis fails. CPU inference can be slow. Installing an AMD-compatible PyTorch build is hardware-specific and may conflict with Chatterbox's pinned dependencies.
 
-Chatterbox accepts native tags such as `[laugh]`, `[cough]`, and `[chuckle]`; an audible effect is not guaranteed. Kokoro's `voice`, `speed`, and emotion-speed settings do not change Chatterbox output.
+### Chatterbox sounds and moods
+
+Nano and Turbo accept sound tags inline. The [official Turbo demo](https://huggingface.co/spaces/ResembleAI/chatterbox-turbo-demo) lists:
+
+`[clear throat]`, `[sigh]`, `[shush]`, `[cough]`, `[groan]`, `[sniff]`, `[gasp]`, `[chuckle]`, `[laugh]`
+
+For example: `That's funny! [chuckle] Anyway, let's continue.` The model may not produce an audible effect every time.
+
+These are sound events, not mood controls. The plugin does not expose Chatterbox mood settings or map its emotion spans to Chatterbox; Kokoro's `voice`, `speed`, and emotion-speed settings do not change Chatterbox output.
 
 ## Controls and emotions
 
