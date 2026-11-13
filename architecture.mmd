@@ -1,0 +1,8 @@
+flowchart LR
+    A[OpenCode TUI] --> B[Select final reply]
+    B --> C[Clean text and split into speech units]
+    C --> D[Python worker]
+    D --> E[Kokoro]
+    D --> F[Chatterbox Nano / Turbo]
+    E --> G[Audio output]
+    F --> G

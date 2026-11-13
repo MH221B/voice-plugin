@@ -1,0 +1,15 @@
+sequenceDiagram
+    participant TUI as OpenCode TUI
+    participant Plugin as TypeScript plugin
+    participant Worker as Python worker
+    participant Model as Voice model
+    participant Audio as Audio device
+
+    TUI->>Plugin: Execution succeeds
+    Plugin->>Plugin: Select final reply and split into units
+    Plugin->>Worker: Speak request with units and config
+    Worker->>Model: Generate first unit
+    Model-->>Worker: Audio
+    Worker->>Audio: Play audio
+    Note over Worker,Model: Chatterbox generates the next unit during playback
+    Worker-->>Plugin: Done, cancelled, or error
