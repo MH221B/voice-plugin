@@ -4,9 +4,9 @@ Local text-to-speech for completed OpenCode TUI replies on Windows. Choose Kokor
 
 ## How it works
 
-![Voice plugin architecture](architecture.svg)
+![Voice plugin architecture](architecture.png)
 
-![Reply to audio sequence](reply-to-audio.svg)
+![Reply to audio sequence](reply-to-audio.png)
 
 ```text
 src/
