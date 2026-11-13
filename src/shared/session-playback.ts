@@ -11,7 +11,13 @@ export class SessionPlayback {
     private client: { send(request: WorkerRequest): boolean },
     private config: VoiceConfig,
     private onError: (sessionId: string, message: string) => void,
+    private onChange: () => void = () => {},
   ) {}
+
+  status(sessionId: string): "ON" | "OFF" | "WORKING" {
+    const session = this.sessions.get(sessionId);
+    return session?.enabled === false ? "OFF" : session?.active ? "WORKING" : "ON";
+  }
 
   private session(id: string): Session {
     let session = this.sessions.get(id);
@@ -32,6 +38,7 @@ export class SessionPlayback {
     const id = randomUUID();
     if (this.client.send({ type: "speak", id, sessionId: answer.sessionId, units, config: this.config })) {
       session.active = id;
+      this.onChange();
     } else {
       session.answers.delete(answer.answerId);
     }
@@ -42,12 +49,17 @@ export class SessionPlayback {
     const id = session.active;
     if (id !== undefined) {
       session.active = undefined;
+      this.onChange();
       this.client.send({ type: "cancel", id });
     }
   }
 
   setEnabled(sessionId: string, enabled: boolean): void {
-    this.session(sessionId).enabled = enabled;
+    const session = this.session(sessionId);
+    if (session.enabled !== enabled) {
+      session.enabled = enabled;
+      this.onChange();
+    }
     if (!enabled) this.stop(sessionId);
   }
 
@@ -55,6 +67,7 @@ export class SessionPlayback {
     const session = this.sessions.get(sessionId);
     if (!session || session.active !== id) return;
     session.active = undefined;
+    this.onChange();
     if (response.type === "error") this.onError(sessionId, response.message);
   }
 }

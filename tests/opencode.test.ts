@@ -20,10 +20,13 @@ function fixture(options: Record<string, unknown> = {}) {
   let sync = async () => {};
   let commands: readonly Command[] = [];
   let disposed = false;
+  let statusRemoved = false;
+  let statusSlot: Parameters<Context["ui"]["slot"]>[0] | undefined;
   let callbacks: Parameters<NonNullable<Parameters<typeof createPlugin>[0]>>[0] | undefined;
   const context = {
     options,
-    ui: { router: { current: () => route }, toast: { show: ({ message }: { message: string }) => toasts.push(message) } },
+    ui: { router: { current: () => route }, toast: { show: ({ message }: { message: string }) => toasts.push(message) },
+      slot: (claim: Parameters<Context["ui"]["slot"]>[0]) => { statusSlot = claim; return () => { statusRemoved = true; }; } },
     keymap: { layer: (factory: () => { commands: readonly Command[] }) => { commands = factory().commands; } },
     data: { on: (type: string, handler: (event: never) => void) => { handlers.set(type, handler); return () => handlers.delete(type); },
       session: { message: { sync: () => sync(), list: () => messages } } },
@@ -44,7 +47,7 @@ function fixture(options: Record<string, unknown> = {}) {
     setRoute: (value: typeof route) => { route = value; },
     setMessages: (value: SessionMessageInfo[]) => { messages = value; },
     setSync: (value: typeof sync) => { sync = value; },
-    disposed: () => disposed, callbacks: () => callbacks };
+    disposed: () => disposed, callbacks: () => callbacks, statusSlot: () => statusSlot, statusRemoved: () => statusRemoved };
 }
 
 function message(overrides: Partial<Extract<SessionMessageInfo, { type: "assistant" }>> = {}): SessionMessageInfo {
@@ -123,6 +126,7 @@ test("rechecks route and generation after sync, including later step", async () 
 test("commands, configuration and worker notifications", async () => {
   const bad = fixture({ speed: 2 }); assert.deepEqual(bad.toasts, ["Invalid voice plugin configuration"]);
   const f = fixture(); f.setMessages([message()]); f.start(); f.step(); f.success(); await tick();
+  assert.equal(f.statusSlot()?.append, "prompt.footer.status");
   assert.deepEqual(f.commands.map((c) => [c.id, c.slash?.name]), [["voice.on", "voice-on"], ["voice.off", "voice-off"], ["voice.stop", "voice-stop"]]);
   const first = f.sent[0]; assert.equal(first.type, "speak");
   f.callbacks()?.onTerminal("s", first.id, { type: "error", id: first.id, message: "device failed" });
@@ -135,5 +139,5 @@ test("commands, configuration and worker notifications", async () => {
   f.commands[2].run(); assert.equal(f.sent[4].type, "cancel");
   f.setRoute({ type: "home" }); f.commands[2].run(); assert.equal(f.toasts.at(-1), "Open a session to control voice");
   f.callbacks()?.onFailure("worker failed"); assert.equal(f.toasts.at(-1), "worker failed");
-  f.cleanup?.();
+  f.cleanup?.(); assert.equal(f.statusRemoved(), true);
 });

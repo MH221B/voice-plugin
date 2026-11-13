@@ -1,4 +1,6 @@
 import * as Plugin from "@opencode/plugin/tui/plugin";
+import { jsx } from "@opentui/solid/jsx-runtime";
+import { createSignal } from "solid-js";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WorkerClient } from "../shared/worker-client.js";
@@ -40,6 +42,7 @@ return Plugin.define({
       toast("Invalid voice plugin configuration");
       return;
     }
+    const [revision, setRevision] = createSignal(0);
     let playback: SessionPlayback;
     let client: Client;
     try {
@@ -48,7 +51,7 @@ return Plugin.define({
         onFailure: (message) => toast(message),
         onDiagnostic: (message) => toast(message),
       });
-      playback = new SessionPlayback(client, { voice, speed, backend, ...(referenceAudio === undefined ? {} : { referenceAudio }) }, (_session, message) => toast(message));
+      playback = new SessionPlayback(client, { voice, speed, backend, ...(referenceAudio === undefined ? {} : { referenceAudio }) }, (_session, message) => toast(message), () => setRevision((value) => value + 1));
     } catch (error) {
       toast(`Voice worker failed: ${String(error)}`);
       return;
@@ -58,6 +61,13 @@ return Plugin.define({
       const route = context.ui.router.current();
       return route.type === "session" ? route.sessionID : undefined;
     };
+    const removeStatus = context.ui.slot({
+      append: "prompt.footer.status",
+      render: (input) => jsx("text", { get children() {
+        revision();
+        return input.sessionID ? `Voice: ${playback.status(input.sessionID)}` : "";
+      } }),
+    });
     const command = (action: (session: string) => void) => () => {
       const session = current();
       if (!session) return toast("Open a session to control voice");
@@ -107,6 +117,7 @@ return Plugin.define({
     return () => {
       disposed = true;
       for (const stop of stops) stop();
+      removeStatus();
       client.dispose();
     };
   },

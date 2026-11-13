@@ -42,3 +42,26 @@ test("failed acceptance permits retry and empty answers do not speak", () => {
   playback.answer({ sessionId: "b", answerId: "2", text: "```\ncode\n```" });
   assert.equal(sent.length, 2);
 });
+
+test("status follows accepted requests and remains session scoped", () => {
+  const sent: WorkerRequest[] = [];
+  let changes = 0;
+  let accepts = false;
+  const playback = new SessionPlayback({ send: (request) => { sent.push(request); return accepts; } },
+    { voice: "af_heart", speed: 1 }, () => {}, () => changes++);
+  const answer = (answerId: string) => playback.answer({ sessionId: "a", answerId, text: "Hello" });
+  assert.equal(playback.status("a"), "ON");
+  answer("1"); assert.equal(playback.status("a"), "ON"); assert.equal(changes, 0);
+  accepts = true; answer("1");
+  const first = sent.at(-1)!;
+  assert.equal(playback.status("a"), "WORKING"); assert.equal(playback.status("b"), "ON");
+  playback.setEnabled("b", false); assert.equal(playback.status("b"), "OFF");
+  playback.finished("a", "stale", { type: "done", id: "stale" });
+  assert.equal(playback.status("a"), "WORKING");
+  playback.finished("a", first.id, { type: "error", id: first.id, message: "failed" });
+  assert.equal(playback.status("a"), "ON");
+  answer("2"); playback.stop("a"); assert.equal(playback.status("a"), "ON");
+  answer("3"); playback.setEnabled("a", false); assert.equal(playback.status("a"), "OFF");
+  playback.setEnabled("a", true); assert.equal(playback.status("a"), "ON");
+  assert.equal(playback.status("b"), "OFF"); assert.ok(changes > 0);
+});
