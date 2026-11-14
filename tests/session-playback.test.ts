@@ -104,3 +104,17 @@ test("stream failure cancels other requests and reports once", () => {
   assert.deepEqual(errors, ["failed"]);
   assert.deepEqual(sent.slice(2), [{ type: "cancel", id: sent[1].id }]);
 });
+
+test("one session owns the enabled slot and switching cancels its request", () => {
+  const sent: WorkerRequest[] = [];
+  const playback = new SessionPlayback({ send: (request) => { sent.push(request); return true; } },
+    { voice: "af_heart", speed: 1 }, () => {});
+  playback.setEnabled("a", true);
+  playback.answer({ sessionId: "a", answerId: "1", text: "Hello." });
+  const first = sent[0];
+  assert.equal(playback.status("a"), "WORKING");
+  playback.setEnabled("b", true);
+  assert.deepEqual(sent[1], { type: "cancel", id: first.id });
+  assert.equal(playback.status("a"), "OFF");
+  assert.equal(playback.status("b"), "ON");
+});

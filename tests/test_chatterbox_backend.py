@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import numpy as np
 from worker.chatterbox_backend import ChatterboxBackend
+from worker.synthesis import RequestContext
 
 
 class Model:
@@ -40,12 +41,12 @@ class BackendTests(unittest.TestCase):
                 modules = {"torch": torch, "chatterbox": types.ModuleType("chatterbox"),
                            "chatterbox.tts_turbo": types.SimpleNamespace(ChatterboxTurboTTS=types.SimpleNamespace(from_pretrained=load))}
                 with patch.dict(sys.modules, modules), patch("sys.platform", platform):
-                    ChatterboxBackend(False, lambda message: None).load(device)
+                    ChatterboxBackend(False).load(device)
                 self.assertEqual(cudnn.enabled, expected)
 
     def test_long_text_is_synthesized_without_dropping_characters(self):
         texts = []
-        backend = ChatterboxBackend(True, lambda message: None)
+        backend = ChatterboxBackend(True)
         backend.model = Model("cpu")
         backend.device = "cpu"
         backend.bundled_conds = backend.model.conds
@@ -75,10 +76,9 @@ class BackendTests(unittest.TestCase):
                    "chatterbox": types.ModuleType("chatterbox"),
                    "chatterbox.tts_turbo": types.SimpleNamespace(ChatterboxTurboTTS=types.SimpleNamespace(from_pretrained=load))}
         with patch.dict(sys.modules, modules):
-            backend = ChatterboxBackend(True, lambda message: None)
-            backend.cancelled = lambda: cancelled
+            backend = ChatterboxBackend(True)
             with self.assertRaisesRegex(RuntimeError, "cancelled"):
-                backend.synthesize("hello", None)
+                backend.synthesize("hello", None, RequestContext(lambda: cancelled))
         self.assertEqual(calls, ["cuda"])
 
     def test_nano_and_turbo_load_and_convert(self):
@@ -89,7 +89,7 @@ class BackendTests(unittest.TestCase):
                        "chatterbox": types.ModuleType("chatterbox"),
                        "chatterbox.tts_turbo": types.SimpleNamespace(ChatterboxTurboTTS=cls)}
             with patch.dict(sys.modules, modules):
-                wav, rate = ChatterboxBackend(nano, lambda message: self.fail(message)).synthesize("hello", None)
+                wav, rate = ChatterboxBackend(nano).synthesize("hello", None, RequestContext(diagnostic=self.fail))
             self.assertEqual(calls, [{"device": "cpu", "nano": nano}])
             self.assertEqual(rate, 22050)
             self.assertEqual(wav.dtype, np.float32)
@@ -107,7 +107,7 @@ class BackendTests(unittest.TestCase):
                        "chatterbox": types.ModuleType("chatterbox"),
                        "chatterbox.tts_turbo": types.SimpleNamespace(ChatterboxTurboTTS=types.SimpleNamespace(from_pretrained=load))}
             with patch.dict(sys.modules, modules):
-                wav, _ = ChatterboxBackend(True, diagnostics.append).synthesize("hello", None)
+                wav, _ = ChatterboxBackend(True).synthesize("hello", None, RequestContext(diagnostic=diagnostics.append))
             self.assertEqual(calls, ["cuda", "cpu"])
             self.assertEqual(len(diagnostics), 1)
             self.assertIn("retrying on CPU", diagnostics[0])
@@ -122,14 +122,15 @@ class BackendTests(unittest.TestCase):
                    "chatterbox": types.ModuleType("chatterbox"),
                    "chatterbox.tts_turbo": types.SimpleNamespace(ChatterboxTurboTTS=types.SimpleNamespace(from_pretrained=load))}
         with patch.dict(sys.modules, modules):
-            backend = ChatterboxBackend(False, diagnostics.append)
-            backend.synthesize("hello", None)
-            backend.synthesize("again", None)
+            backend = ChatterboxBackend(False)
+            context = RequestContext(diagnostic=diagnostics.append)
+            backend.synthesize("hello", None, context)
+            backend.synthesize("again", None, context)
         self.assertEqual(calls, ["cuda"])
         self.assertEqual(diagnostics, [])
 
     def test_missing_dependencies_and_conditioning(self):
-        backend = ChatterboxBackend(True, lambda message: None)
+        backend = ChatterboxBackend(True)
         with patch.dict(sys.modules, {"torch": None}):
             with self.assertRaisesRegex(RuntimeError, "PyTorch missing"):
                 backend.synthesize("hello", None)
@@ -145,7 +146,7 @@ class BackendTests(unittest.TestCase):
             backend.synthesize("hello", "relative.wav")
 
     def test_invalid_audio_and_reference_conditioning(self):
-        backend = ChatterboxBackend(True, lambda message: None)
+        backend = ChatterboxBackend(True)
         backend.model = Model("cpu")
         backend.device = "cpu"
         backend.bundled_conds = backend.model.conds
@@ -157,7 +158,7 @@ class BackendTests(unittest.TestCase):
             calls.append((audio_prompt_path, backend.model.conds))
             return np.array([0.5])
         backend.model.generate = generate
-        def prepare(reference):
+        def prepare(reference, context=None):
             backend.model.conds = "reference conditioning" if reference else backend.bundled_conds
         with patch.object(backend, "prepare_voice", side_effect=prepare), tempfile.NamedTemporaryFile() as reference:
             backend.synthesize("first", reference.name)

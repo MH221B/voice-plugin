@@ -138,6 +138,48 @@ main.main()
 
 
 class WorkerTests(unittest.TestCase):
+    def test_request_queue_limit_reports_error(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def pipeline(text, **kwargs):
+            entered.set()
+            release.wait(3)
+            yield None, None, [text]
+
+        self.start(lambda language: pipeline)
+        self.input.send(speak("active"))
+        self.assertTrue(entered.wait(2))
+        for index in range(32):
+            self.input.send(speak(f"queued-{index}"))
+        self.input.send(speak("overflow"))
+        try:
+            response = self.output.queue.get(timeout=3)
+        finally:
+            release.set()
+        self.assertEqual(response, {"type": "error", "id": "overflow",
+                                    "message": "Speech request queue overflow"})
+
+    def test_structural_protocol_errors(self):
+        self.start(lambda language: lambda text, **kwargs: [(None, None, [0])])
+        for line, message in (
+            ("[]", "request must be an object"),
+            ('{"id": 1, "type": "speak"}', "invalid request id"),
+            ('{"id": "x", "type": "other"}', "invalid request type"),
+            ('{"id": "x", "type": "speak", "sessionId": "", "config": {}}', "invalid session id"),
+            ('{"id": "x", "type": "speak", "sessionId": "s", "config": []}', "invalid config"),
+            ('{"id": "x", "type": "speak", "sessionId": "s", "config": {}}', "invalid units"),
+        ):
+            self.input.queue.put(line)
+            response = self.output.queue.get(timeout=2)
+            self.assertEqual(response["type"], "error")
+            self.assertIn(message, response["message"])
+        request = speak("bad-unit")
+        request["units"][0]["boundary"] = "line"
+        self.input.send(request)
+        response = self.output.queue.get(timeout=2)
+        self.assertEqual(response["type"], "error")
+        self.assertIn("invalid unit", response["message"])
+
     def setUp(self):
         self.input = Input()
         self.output = Output()
@@ -163,9 +205,9 @@ class WorkerTests(unittest.TestCase):
     def test_cosyvoice_routing_validation_and_order(self):
         calls = []
         class Adapter:
-            def __init__(self, source, model, diagnostic):
+            def __init__(self, source, model):
                 calls.append((source, model))
-            def synthesize(self, text, reference):
+            def synthesize(self, text, reference, context=None):
                 calls.append((text, reference))
                 return [text], 24000
         with patch("worker.cosyvoice_backend.CosyVoiceBackend", Adapter):
@@ -186,9 +228,9 @@ class WorkerTests(unittest.TestCase):
     def test_cosyvoice_cancel_suppresses_inflight_audio(self):
         entered, release = threading.Event(), threading.Event()
         class Adapter:
-            def __init__(self, source, model, diagnostic):
+            def __init__(self, source, model):
                 pass
-            def synthesize(self, text, reference):
+            def synthesize(self, text, reference, context=None):
                 entered.set()
                 release.wait(3)
                 return [text], 24000
@@ -394,9 +436,9 @@ class WorkerTests(unittest.TestCase):
         rates = []
 
         class FakeBackend:
-            def __init__(self, nano, diagnostic):
+            def __init__(self, nano):
                 pass
-            def synthesize(self, text, reference):
+            def synthesize(self, text, reference, context=None):
                 if text == "second":
                     synthesized.set()
                 return [text], 16000 if text == "first" else 24000
@@ -560,10 +602,10 @@ class WorkerTests(unittest.TestCase):
         playing, second_ready, release = threading.Event(), threading.Event(), threading.Event()
 
         class FakeBackend:
-            def __init__(self, nano, diagnostic):
+            def __init__(self, nano):
                 pass
 
-            def synthesize(self, text, reference):
+            def synthesize(self, text, reference, context=None):
                 if text == "second":
                     self.assert_playing = playing.wait(2)
                     if self.assert_playing:
@@ -594,10 +636,10 @@ class WorkerTests(unittest.TestCase):
         playing, prefetched = threading.Event(), threading.Event()
 
         class FakeBackend:
-            def __init__(self, nano, diagnostic):
+            def __init__(self, nano):
                 pass
 
-            def synthesize(self, text, reference):
+            def synthesize(self, text, reference, context=None):
                 if text == "second":
                     playing.wait(2)
                     prefetched.set()
@@ -622,15 +664,56 @@ class WorkerTests(unittest.TestCase):
             self.assertTrue(audio.aborted.is_set())
             self.assertEqual(self.writes, [])
 
+    def test_chatterbox_reuses_backend_with_new_context_after_cancellation(self):
+        entered, release = threading.Event(), threading.Event()
+        instances, contexts = [], []
+
+        class FakeBackend:
+            def __init__(self, nano):
+                instances.append(self)
+
+            def synthesize(self, text, reference, context=None):
+                contexts.append(context)
+                if text == "first":
+                    entered.set()
+                    release.wait(3)
+                    context.diagnostic("stale")
+                else:
+                    if context.cancelled():
+                        raise RuntimeError("second request was cancelled")
+                    context.diagnostic("second request")
+                return [text], 24000
+
+        with patch("worker.chatterbox_backend.ChatterboxBackend", FakeBackend):
+            self.start(lambda _: None, lambda rate: Audio(self.writes))
+            first = speak("first", ("first",))
+            second = speak("second", ("second",))
+            first["config"]["backend"] = second["config"]["backend"] = "chatterbox-nano"
+            self.input.send(first)
+            try:
+                self.assertTrue(entered.wait(2))
+                self.input.send({"type": "cancel", "id": "first"})
+                self.result("cancelled", "first")
+                self.input.send(second)
+            finally:
+                release.set()
+            self.assertEqual(self.output.queue.get(timeout=3),
+                             {"type": "diagnostic", "id": "second", "message": "second request"})
+            self.result("done", "second")
+            self.assertEqual(len(instances), 1)
+            self.assertEqual(len(contexts), 2)
+            self.assertIsNot(contexts[0], contexts[1])
+            self.assertEqual(self.writes, [["second"]])
+            self.assertTrue(self.output.queue.empty())
+
     def test_chatterbox_rate_selection_and_diagnostic(self):
         import numpy as np
         rates, calls = [], []
         class FakeBackend:
-            def __init__(self, nano, diagnostic):
+            def __init__(self, nano):
                 calls.append(nano)
-                self.diagnostic = diagnostic
-            def synthesize(self, text, reference):
-                self.diagnostic("GPU failed; retrying on CPU")
+            def synthesize(self, text, reference, context=None):
+                context.diagnostic("GPU failed; retrying on CPU")
                 return np.array([0.25, 0.5], dtype=np.float32), 22050
         def stream(rate):
             rates.append(rate)
@@ -650,12 +733,12 @@ class WorkerTests(unittest.TestCase):
         import numpy as np
         entered, release = threading.Event(), threading.Event()
         class FakeBackend:
-            def __init__(self, nano, diagnostic):
-                self.diagnostic = diagnostic
-            def synthesize(self, text, reference):
+            def __init__(self, nano):
+                pass
+            def synthesize(self, text, reference, context=None):
                 entered.set()
                 release.wait(3)
-                self.diagnostic("stale")
+                context.diagnostic("stale")
                 return np.array([1], dtype=np.float32), 16000
         with patch("worker.chatterbox_backend.ChatterboxBackend", FakeBackend):
             self.start(lambda language: self.fail("Kokoro must not load"), lambda rate: Audio(self.writes))

@@ -3,7 +3,8 @@ import { test } from "node:test";
 import { resolve } from "node:path";
 import type { OpenCodeEvent, SessionMessageInfo } from "@opencode/client";
 import type { Plugin } from "@opencode/plugin/tui";
-import { createPlugin } from "../src/opencode/index.js";
+import { createPlugin, footerVoiceLabel } from "../src/opencode/index.js";
+import { SessionPlayback } from "../src/shared/session-playback.js";
 import type { WorkerRequest } from "../src/shared/types.js";
 
 type Context = Plugin.Context;
@@ -16,10 +17,10 @@ function fixture(options: Record<string, unknown> = {}) {
   const sent: WorkerRequest[] = [];
   const toasts: string[] = [];
   let route: ReturnType<Context["ui"]["router"]["current"]> = { type: "session", sessionID: "s" };
-  let messages: SessionMessageInfo[] = [];
+  const messages = new Map<string, SessionMessageInfo[]>();
   let sync = async () => {};
-  let parentID: string | undefined;
-  let sessionKnown = true;
+  const parents = new Map<string, string | undefined>();
+  const known = new Set(["s", "other"]);
   let syncSession = async () => {};
   let commands: readonly Command[] = [];
   let disposed = false;
@@ -32,7 +33,7 @@ function fixture(options: Record<string, unknown> = {}) {
       slot: (claim: Parameters<Context["ui"]["slot"]>[0]) => { statusSlot = claim; return () => { statusRemoved = true; }; } },
     keymap: { layer: (factory: () => { commands: readonly Command[] }) => { commands = factory().commands; } },
     data: { on: (type: string, handler: (event: never) => void) => { handlers.set(type, handler); return () => handlers.delete(type); },
-      session: { get: () => sessionKnown ? { id: "s", parentID } : undefined, sync: () => syncSession(), message: { sync: () => sync(), list: () => messages } } },
+      session: { get: (id: string) => known.has(id) ? { id, parentID: parents.get(id) } : undefined, sync: () => syncSession(), message: { sync: () => sync(), list: (id: string) => messages.get(id) ?? [] } } },
   } as unknown as Context;
   const plugin = createPlugin((value) => { callbacks = value; return {
     send: (request) => { sent.push(request); return true; }, dispose: () => { disposed = true; },
@@ -41,17 +42,19 @@ function fixture(options: Record<string, unknown> = {}) {
   function emit<T extends EventType>(type: T, data: EventOf<T>["data"]) {
     handlers.get(type)?.({ type, data } as never);
   }
-  const start = () => emit("session.execution.started", { sessionID: "s" });
-  const step = (id = "answer", finish: "stop" | "tool-calls" = "stop") => emit("session.step.ended", {
-    sessionID: "s", assistantMessageID: id, finish, cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+  const start = (sessionID = "s") => emit("session.execution.started", { sessionID });
+  const step = (id = "answer", finish: "stop" | "tool-calls" = "stop", sessionID = "s") => emit("session.step.ended", {
+    sessionID, assistantMessageID: id, finish, cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
   });
-  const success = () => emit("session.execution.succeeded", { sessionID: "s" });
+  const success = (sessionID = "s") => emit("session.execution.succeeded", { sessionID });
   return { emit, start, step, success, sent, toasts, handlers, commands, cleanup,
     setRoute: (value: typeof route) => { route = value; },
-    setMessages: (value: SessionMessageInfo[]) => { messages = value; },
+    setMessages: (value: SessionMessageInfo[], id = "s") => { messages.set(id, value); },
     setSync: (value: typeof sync) => { sync = value; },
-    setParent: (value: string | undefined) => { parentID = value; },
-    setSessionKnown: (value: boolean) => { sessionKnown = value; },
+    setParent: (value: string | undefined) => { parents.set("s", value); },
+    setParentFor: (id: string, value: string | undefined) => { parents.set(id, value); },
+    setKnown: (id: string, value: boolean) => { if (value) known.add(id); else known.delete(id); },
+    setSessionKnown: (value: boolean) => { if (value) known.add("s"); else known.delete("s"); },
     setSessionSync: (value: typeof syncSession) => { syncSession = value; },
     disposed: () => disposed, callbacks: () => callbacks, statusSlot: () => statusSlot, statusRemoved: () => statusRemoved };
 }
@@ -162,6 +165,7 @@ test("enabled session speaks completed replies while viewing another session", a
 
 test("does not speak a completed child session", async () => {
   const f = fixture();
+  f.commands[0].run();
   f.setParent("parent");
   f.setMessages([message()]);
   f.start(); f.step(); f.success(); await tick();
@@ -325,11 +329,11 @@ test("enabling a child or unknown session leaves the enabled root playing", asyn
   f.setMessages([message()]); f.start(); f.step(); f.success(); await tick();
   assert.equal(f.sent.length, 1);
   f.setRoute({ type: "session", sessionID: "other" });
-  f.setParent("s"); f.commands[0].run();
-  f.setParent(undefined); f.setSessionKnown(false); f.commands[0].run();
+  f.setParentFor("other", "s"); f.commands[0].run();
+  f.setParentFor("other", undefined); f.setKnown("other", false); f.commands[0].run();
   assert.equal(f.sent.length, 1);
   assert.equal(f.toasts.length, 2);
-  f.setSessionKnown(true); f.setRoute({ type: "session", sessionID: "s" });
+  f.setKnown("other", true); f.setRoute({ type: "session", sessionID: "s" });
   f.commands[2].run();
   assert.equal(f.sent[1].type, "cancel");
   f.cleanup?.();
@@ -348,5 +352,61 @@ test("navigation preserves playback until voice is enabled in another root sessi
   f.setRoute({ type: "session", sessionID: "s" });
   f.start(); f.step("later"); f.setMessages([message({ id: "later" })]); f.success(); await tick();
   assert.equal(f.sent.length, 2);
+  f.cleanup?.();
+});
+
+test("tool-calls finish lets the next step resume streaming", () => {
+  const f = fixture({ streamSpeech: true });
+  f.commands[0].run(); f.start();
+  f.emit("session.step.started", { sessionID: "s", assistantMessageID: "answer", agent: "agent", model: { providerID: "p", id: "m" }, started: 1 });
+  f.emit("session.text.started", { sessionID: "s", assistantMessageID: "answer", ordinal: 0 });
+  f.emit("session.text.delta", { sessionID: "s", assistantMessageID: "answer", ordinal: 0, delta: "Before. " });
+  f.emit("session.text.ended", { sessionID: "s", assistantMessageID: "answer", ordinal: 0, text: "Before. " });
+  f.step("answer", "tool-calls");
+  f.emit("session.step.started", { sessionID: "s", assistantMessageID: "next", agent: "agent", model: { providerID: "p", id: "m" }, started: 2 });
+  f.emit("session.text.started", { sessionID: "s", assistantMessageID: "next", ordinal: 0 });
+  f.emit("session.text.delta", { sessionID: "s", assistantMessageID: "next", ordinal: 0, delta: "After. " });
+  assert.deepEqual(f.sent.map((request) => request.type), ["speak", "cancel", "speak"]);
+  const resumed = f.sent[2];
+  assert.equal(resumed.type, "speak");
+  assert.equal(resumed.units[0].text, "After.");
+  f.cleanup?.();
+});
+
+test("footer label reflects playback status for root sessions", () => {
+  const sent: WorkerRequest[] = [];
+  const playback = new SessionPlayback({ send: (request) => { sent.push(request); return true; } },
+    { voice: "af_heart", speed: 1 }, () => {});
+  const isRoot = (id: string) => id === "s";
+  assert.equal(footerVoiceLabel(playback, undefined, isRoot), "");
+  assert.equal(footerVoiceLabel(playback, "child", isRoot), "");
+  assert.equal(footerVoiceLabel(playback, "s", isRoot), "Voice: OFF");
+  playback.setEnabled("s", true);
+  assert.equal(footerVoiceLabel(playback, "s", isRoot), "Voice: ON");
+  playback.answer({ sessionId: "s", answerId: "1", text: "Hello." });
+  assert.equal(footerVoiceLabel(playback, "s", isRoot), "Voice: WORKING");
+  playback.finished("s", sent[0].id, { type: "done", id: sent[0].id });
+  assert.equal(footerVoiceLabel(playback, "s", isRoot), "Voice: ON");
+});
+
+test("sibling root sessions keep separate messages and voice ownership", async () => {
+  const f = fixture();
+  f.commands[0].run();
+  f.setMessages([message()]);
+  f.start(); f.step(); f.success(); await tick();
+  assert.equal(f.sent.length, 1);
+  const first = f.sent[0];
+  assert.equal(first.type, "speak");
+  assert.equal(first.sessionId, "s");
+  f.setRoute({ type: "session", sessionID: "other" });
+  f.commands[0].run();
+  assert.deepEqual(f.sent[1], { type: "cancel", id: first.id });
+  f.setMessages([message({ id: "other-answer", content: [{ type: "text", text: "Other" }] })], "other");
+  f.start("other"); f.step("other-answer", "stop", "other"); f.success("other"); await tick();
+  assert.equal(f.sent.length, 3);
+  const other = f.sent[2];
+  assert.equal(other.type, "speak");
+  assert.equal(other.sessionId, "other");
+  assert.equal(other.units[0].text, "Other");
   f.cleanup?.();
 });

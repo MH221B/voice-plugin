@@ -12,6 +12,7 @@ except ImportError:
     np = sf = None
 
 from worker.cosyvoice_backend import CosyVoiceBackend, MODEL_FILES, SOURCE_FILES
+from worker.synthesis import RequestContext
 
 
 @unittest.skipUnless(np is not None and sf is not None, "requires numpy and soundfile")
@@ -21,7 +22,7 @@ class CosyVoiceTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.reference = self.root / "reference.wav"
-        self.adapter = CosyVoiceBackend(str(self.root / "source"), str(self.root / "model"), lambda _: None)
+        self.adapter = CosyVoiceBackend(str(self.root / "source"), str(self.root / "model"))
         self.adapter.identity = "model"
         self.seen = []
         self.model = SimpleNamespace(frontend=SimpleNamespace(spk2info={}), sample_rate=24000)
@@ -75,14 +76,13 @@ class CosyVoiceTests(unittest.TestCase):
     def test_cancelled_preparation_removes_partial_entry(self):
         self.write_reference(2)
         state = [False]
-        self.adapter.cancelled = lambda: state[0]
         def cancel(text, path, speaker_id):
             self.model.frontend.spk2info[speaker_id] = {}
             state[0] = True
             return True
         self.model.add_zero_shot_spk = cancel
         with self.assertRaisesRegex(RuntimeError, "cancelled"):
-            self.adapter.prepare_voice(str(self.reference))
+            self.adapter.prepare_voice(str(self.reference), RequestContext(lambda: state[0]))
         self.assertEqual(self.model.frontend.spk2info, {})
 
     def test_model_is_validated_before_loading(self):

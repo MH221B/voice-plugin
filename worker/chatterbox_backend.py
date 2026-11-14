@@ -3,22 +3,22 @@ import os
 import sys
 
 from worker import conditioning_cache
+from worker.synthesis import RequestContext
 
 
 class ChatterboxBackend:
-    def __init__(self, nano, diagnostic):
+    def __init__(self, nano):
         self.nano = nano
-        self.diagnostic = diagnostic
         self.model = None
         self.device = None
         self.bundled_conds = None
-        self.cancelled = lambda: False
         self.normalize = lambda text: text
         self.version = None
         self.conditioning_key = None
         self.module = None
 
-    def load(self, device):
+    def load(self, device, context=None):
+        context = context or RequestContext()
         if device == "cuda" and sys.platform == "win32":
             import torch
             if getattr(getattr(torch, "version", None), "hip", None):
@@ -36,7 +36,8 @@ class ChatterboxBackend:
         self.version = None
         self.conditioning_key = None
 
-    def prepare_voice(self, reference):
+    def prepare_voice(self, reference, context=None):
+        context = context or RequestContext()
         if reference is None:
             self.model.conds = self.bundled_conds
             self.conditioning_key = None
@@ -60,27 +61,27 @@ class ChatterboxBackend:
             self.model.conds = conditioning_cache.load(path, reference_hash, self.device, self.module)
         except Exception as exc:
             log_exception()
-            self.check_cancelled()
+            self.check_cancelled(context)
             if reference_hash is None:
                 raise ValueError(f"Reference audio is missing and no valid matching conditioning cache exists: {reference}") from exc
             self.model.prepare_conditionals(reference, exaggeration=0.0)
-            self.check_cancelled()
+            self.check_cancelled(context)
             if conditioning_cache.file_hash(reference) != reference_hash:
                 raise ValueError("Reference audio changed while preparing conditioning; retry")
             conditioning_cache.save(path, self.model.conds, reference_hash)
         self.conditioning_key = key
 
-    def check_cancelled(self):
-        if self.cancelled():
-            raise RuntimeError("Chatterbox request cancelled")
+    def check_cancelled(self, context):
+        context.check_cancelled("Chatterbox request cancelled")
 
-    def split_text(self, text):
+    def split_text(self, text, context=None):
+        context = context or RequestContext()
         def fits(value):
             return len(self.model.tokenizer(self.normalize(value), truncation=False)["input_ids"]) <= 1024
 
         parts = []
         while text:
-            self.check_cancelled()
+            self.check_cancelled(context)
             if fits(text):
                 parts.append(text)
                 break
@@ -106,8 +107,9 @@ class ChatterboxBackend:
             text = text[cut:]
         return parts
 
-    def synthesize(self, text, reference):
-        self.check_cancelled()
+    def synthesize(self, text, reference, context=None):
+        context = context or RequestContext()
+        self.check_cancelled(context)
         if reference is not None and not os.path.isabs(reference):
             raise ValueError("referenceAudio must be an absolute path to an existing audio file or cached reference")
         if self.model is None:
@@ -119,27 +121,27 @@ class ChatterboxBackend:
                 gpu = torch.cuda.is_available()
             except Exception as exc:
                 log_exception()
-                self.diagnostic(f"GPU detection failed; retrying on CPU: {exc}")
+                context.diagnostic(f"GPU detection failed; retrying on CPU: {exc}")
                 gpu = False
             if gpu:
                 try:
-                    self.load("cuda")
+                    self.load("cuda", context)
                 except Exception as exc:
                     log_exception()
-                    self.check_cancelled()
-                    self.diagnostic(f"GPU initialization failed; retrying on CPU: {exc}")
+                    self.check_cancelled(context)
+                    context.diagnostic(f"GPU initialization failed; retrying on CPU: {exc}")
             if self.model is None:
-                self.check_cancelled()
-                self.load("cpu")
-        self.check_cancelled()
-        parts = self.split_text(text)
+                self.check_cancelled(context)
+                self.load("cpu", context)
+        self.check_cancelled(context)
+        parts = self.split_text(text, context)
         if len(parts) > 1:
             import numpy as np
             audio = []
             rate = None
             for part in parts:
-                self.check_cancelled()
-                samples, current_rate = self.synthesize(part, reference)
+                self.check_cancelled(context)
+                samples, current_rate = self.synthesize(part, reference, context)
                 if rate is not None and rate != current_rate:
                     raise ValueError("Chatterbox sample rate changed within a unit")
                 rate = current_rate
@@ -148,22 +150,22 @@ class ChatterboxBackend:
         if reference is None and self.bundled_conds is None:
             raise ValueError("Chatterbox has no bundled conditioning; set referenceAudio to an absolute audio path")
         try:
-            self.prepare_voice(reference)
-            self.check_cancelled()
+            self.prepare_voice(reference, context)
+            self.check_cancelled(context)
             wav = self.model.generate(text, audio_prompt_path=None)
         except Exception as exc:
             log_exception()
-            self.check_cancelled()
+            self.check_cancelled(context)
             if self.device != "cuda":
                 raise RuntimeError(f"Chatterbox synthesis failed (check reference audio): {exc}") from exc
-            self.diagnostic(f"GPU synthesis failed; retrying on CPU: {exc}")
+            context.diagnostic(f"GPU synthesis failed; retrying on CPU: {exc}")
             self.model = None
-            self.check_cancelled()
-            self.load("cpu")
-            self.check_cancelled()
+            self.check_cancelled(context)
+            self.load("cpu", context)
+            self.check_cancelled(context)
             try:
-                self.prepare_voice(reference)
-                self.check_cancelled()
+                self.prepare_voice(reference, context)
+                self.check_cancelled(context)
                 wav = self.model.generate(text, audio_prompt_path=None)
             except Exception as cpu_exc:
                 log_exception()

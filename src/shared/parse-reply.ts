@@ -1,17 +1,5 @@
-import type { Emotion, Emotions, SpeechUnit } from "./types.js";
-
-const names = new Set<string>(["calm", "excited", "sad", "reassuring", "serious"]);
-
-function weights(value: string): Emotions {
-  const result: Emotions = {};
-  for (const entry of value.split(",")) {
-    const match = /^\s*([a-z]+)\s*:\s*((?:\d+(?:\.\d*)?|\.\d+))\s*$/.exec(entry);
-    if (match && names.has(match[1]) && Number(match[2]) <= 1) {
-      result[match[1] as Emotion] = Number(match[2]);
-    }
-  }
-  return result;
-}
+import { emotionWeights, isVoiceClosing, voiceWeights } from "./speech-grammar.js";
+import type { Emotions, SpeechUnit } from "./types.js";
 
 function withoutFences(input: string): string {
   let output = "";
@@ -57,7 +45,7 @@ export function parseReply(input: string): SpeechUnit[] {
   }));
   const stack: number[] = [];
   for (let i = 0; i < tags.length; i++) {
-    if (/^\[\/voice\s*\]$/i.test(tags[i].text)) {
+    if (isVoiceClosing(tags[i].text.slice(1, -1))) {
       const open = stack.pop();
       if (open !== undefined) {
         tags[open].pair = i;
@@ -78,13 +66,14 @@ export function parseReply(input: string): SpeechUnit[] {
   let emotions: Emotions = {};
   for (let i = 0; i < tags.length; i++) {
     const tag = tags[i];
+    const label = tag.text.slice(1, -1);
+    const opening = voiceWeights(label);
     parts.push({ text: text.slice(position, tag.start), emotions });
-    const opening = /^\[voice\s+emotions="([^"\n]*)"\s*\]$/.exec(tag.text);
-    if (!opening && !/^\[\/voice\s*\]$/i.test(tag.text)) {
+    if (opening === undefined && !isVoiceClosing(label)) {
       parts.push({ text: tag.text, emotions: {} });
     }
-    if (opening && tag.pair > i && !tag.nested) emotions = weights(opening[1]);
-    if (tag.pair < i && tag.pair >= 0 && !tag.nested) emotions = {};
+    if (opening !== undefined && tag.pair > i && !tag.nested) emotions = emotionWeights(opening);
+    if (isVoiceClosing(label) && tag.pair < i && tag.pair >= 0 && !tag.nested) emotions = {};
     position = tag.end;
   }
   parts.push({ text: text.slice(position), emotions });

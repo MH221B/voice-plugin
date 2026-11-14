@@ -9,6 +9,7 @@ import tempfile
 import types
 
 from worker.conditioning_cache import file_hash
+from worker.synthesis import RequestContext
 
 
 SOURCE_FILES = ("cosyvoice/cli/cosyvoice.py", "third_party/Matcha-TTS/matcha/__init__.py")
@@ -22,18 +23,15 @@ PREFIX = "You are a helpful assistant.<|endofprompt|>"
 
 
 class CosyVoiceBackend:
-    def __init__(self, source, model_dir, diagnostic):
+    def __init__(self, source, model_dir):
         self.source = source
         self.model_dir = model_dir
-        self.diagnostic = diagnostic
-        self.cancelled = lambda: False
         self.model = None
         self.identity = None
         self.speaker_id = None
 
-    def check_cancelled(self):
-        if self.cancelled():
-            raise RuntimeError("CosyVoice request cancelled")
+    def check_cancelled(self, context):
+        context.check_cancelled("CosyVoice request cancelled")
 
     def validate_paths(self):
         for label, root, names in (("source", self.source, SOURCE_FILES), ("model", self.model_dir, MODEL_FILES)):
@@ -47,21 +45,22 @@ class CosyVoiceBackend:
             if (Path(self.model_dir) / name).exists():
                 raise ValueError(f"CosyVoice 3 model directory contains conflicting {name}")
 
-    def load(self):
+    def load(self, context=None):
+        context = context or RequestContext()
         self.validate_paths()
-        self.check_cancelled()
+        self.check_cancelled(context)
         digest = hashlib.sha256(b"cosyvoice3-reference-10s-v1")
         for root, names in ((self.source, SOURCE_FILES), (self.model_dir, MODEL_FILES)):
             digest.update(os.path.realpath(root).encode("utf-8"))
             for name in names:
                 digest.update(name.encode("utf-8"))
                 digest.update(file_hash(Path(root) / name).encode("ascii"))
-                self.check_cancelled()
+                self.check_cancelled(context)
         for directory in (Path(self.source) / "cosyvoice", Path(self.source) / "third_party" / "Matcha-TTS" / "matcha"):
             for path in sorted(directory.rglob("*.py")):
                 digest.update(str(path.relative_to(self.source)).encode("utf-8"))
                 digest.update(file_hash(path).encode("ascii"))
-                self.check_cancelled()
+                self.check_cancelled(context)
         try:
             import soundfile as sf
             import torch
@@ -84,34 +83,35 @@ class CosyVoiceBackend:
                     if exc.name != "pyworld":
                         raise
                     sys.modules["pyworld"] = types.ModuleType("pyworld")
-                    self.diagnostic("CosyVoice: pyworld unavailable; training-only pitch operations disabled")
+                    context.diagnostic("CosyVoice: pyworld unavailable; training-only pitch operations disabled")
             from cosyvoice.cli.cosyvoice import AutoModel
-            self.check_cancelled()
+            self.check_cancelled(context)
             model = AutoModel(model_dir=self.model_dir)
-            self.check_cancelled()
+            self.check_cancelled(context)
             devices = {name: str(next(getattr(model.model, name).parameters()).device)
                        for name in ("llm", "flow", "hift")}
             providers = model.frontend.speech_tokenizer_session.get_providers()
-            self.diagnostic(f"CosyVoice model devices: {devices}; speech tokenizer providers: {providers}")
+            context.diagnostic(f"CosyVoice model devices: {devices}; speech tokenizer providers: {providers}")
             self.model = model
             self.identity = digest.hexdigest()
         except Exception as exc:
             log_exception()
-            self.check_cancelled()
+            self.check_cancelled(context)
             raise RuntimeError(f"CosyVoice initialization failed; check local dependencies and model: {exc}") from exc
 
-    def prepare_voice(self, reference):
+    def prepare_voice(self, reference, context=None):
+        context = context or RequestContext()
         import numpy as np
         import soundfile as sf
 
-        self.check_cancelled()
+        self.check_cancelled(context)
         if not isinstance(reference, str) or not os.path.isabs(reference):
             raise ValueError("CosyVoice referenceAudio must be an absolute audio path")
         try:
             reference_hash = file_hash(reference)
         except OSError as exc:
             raise ValueError(f"Cannot read reference audio {reference}: {exc}") from exc
-        self.check_cancelled()
+        self.check_cancelled(context)
         speaker_id = hashlib.sha256((self.identity + reference_hash).encode("ascii")).hexdigest()
         if speaker_id == self.speaker_id:
             return speaker_id
@@ -131,13 +131,13 @@ class CosyVoiceBackend:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as output:
                 temporary = output.name
             sf.write(temporary, samples.mean(axis=1, dtype=np.float32), rate, subtype="FLOAT")
-            self.check_cancelled()
+            self.check_cancelled(context)
             if not self.model.add_zero_shot_spk("", temporary, speaker_id):
                 raise ValueError("CosyVoice rejected reference conditioning")
-            self.check_cancelled()
+            self.check_cancelled(context)
             if file_hash(reference) != reference_hash:
                 raise ValueError("reference audio changed during preparation; retry")
-            self.check_cancelled()
+            self.check_cancelled(context)
             if self.speaker_id is not None:
                 self.model.frontend.spk2info.pop(self.speaker_id, None)
             self.speaker_id = speaker_id
@@ -145,26 +145,27 @@ class CosyVoiceBackend:
         except Exception as exc:
             log_exception()
             self.model.frontend.spk2info.pop(speaker_id, None)
-            self.check_cancelled()
+            self.check_cancelled(context)
             raise ValueError(f"CosyVoice reference audio {reference}: {exc}") from exc
         finally:
             if temporary is not None:
                 os.unlink(temporary)
 
-    def synthesize(self, text, reference):
-        self.check_cancelled()
+    def synthesize(self, text, reference, context=None):
+        context = context or RequestContext()
+        self.check_cancelled(context)
         if self.model is None:
-            self.load()
-        speaker_id = self.prepare_voice(reference)
-        self.check_cancelled()
+            self.load(context)
+        speaker_id = self.prepare_voice(reference, context)
+        self.check_cancelled(context)
         try:
             chunks = list(self.model.inference_cross_lingual(
                 PREFIX + re.sub(r"(?<=\w)[‘’](?=\w)", "'", text), "", zero_shot_spk_id=speaker_id, stream=False, text_frontend=False))
         except Exception as exc:
             log_exception()
-            self.check_cancelled()
+            self.check_cancelled(context)
             raise RuntimeError(f"CosyVoice inference failed: {exc}") from exc
-        self.check_cancelled()
+        self.check_cancelled(context)
         import numpy as np
         pieces = [np.asarray(chunk["tts_speech"].detach().cpu().numpy(), dtype=np.float32).reshape(-1)
                   for chunk in chunks]

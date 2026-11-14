@@ -1,4 +1,7 @@
-// Return only constructs whose meaning is established by the received prefix.
+import { isSoundTag, isVoiceLabel, onlySoundTags, voiceWeights } from "./speech-grammar.js";
+
+// Decide only which prefix is safe to expose. `parseReply` remains the single
+// authority for sentence splitting, voice emotions, and speakable text.
 // Unsupported or malformed constructs are withheld rather than spoken.
 function scan(text: string, final: boolean): { end: number; speech: string } {
   let speech = "";
@@ -41,18 +44,29 @@ function scan(text: string, final: boolean): { end: number; speech: string } {
       if (close < 0) break;
       const label = text.slice(start + 1, close);
       if (/\[|\n/.test(label)) break;
-      if (/^\/?voice\b/i.test(label)) {
-        if (!/^voice\s+emotions="[^"\n]*"\s*$/.test(label)) break;
+      const definition = text[close + 1] === ":" &&
+        /^ {0,3}$/.test(text.slice(text.lastIndexOf("\n", i - 1) + 1, i));
+      if (isVoiceLabel(label)) {
+        if (voiceWeights(label) === undefined) break;
         const closing = text.indexOf("[/voice]", close + 1);
         if (closing < 0) break;
         const body = text.slice(close + 1, closing);
-        if (/\[|\]|`|~|<|\\|https?:\/\//i.test(body)) {
+        if (/`|~|<|\\|https?:\/\//i.test(body) || !onlySoundTags(body)) {
           i = closing + 8;
           continue;
         }
         speech += text.slice(i, closing + 8);
         i = closing + 8;
         continue;
+      }
+      if (c === "[" && isSoundTag(label)) {
+        if (close + 1 === text.length && !final) break;
+        const next = text[close + 1];
+        if (next !== "(" && next !== "[" && !definition) {
+          speech += text.slice(i, close + 1);
+          i = close + 1;
+          continue;
+        }
       }
       if (close + 1 === text.length && !final) break;
       const next = text[close + 1];
@@ -65,7 +79,7 @@ function scan(text: string, final: boolean): { end: number; speech: string } {
         continue;
       }
       // A reference definition is metadata, not speech.
-      if (next === ":" && (i === 0 || text[i - 1] === "\n")) {
+      if (definition) {
         const end = text.indexOf("\n", close + 2);
         if (end < 0 && !final) break;
         i = end < 0 ? text.length : end + 1;

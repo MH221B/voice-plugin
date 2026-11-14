@@ -6,6 +6,7 @@ type Session = { enabled: boolean; answers: Set<string>; active: Set<string>; ge
 
 export class SessionPlayback {
   private sessions = new Map<string, Session>();
+  private owner?: string;
 
   constructor(
     private client: { send(request: WorkerRequest): boolean },
@@ -60,6 +61,8 @@ export class SessionPlayback {
     return session.enabled ? session.generation : undefined;
   }
 
+  // `text` is markup-safe output from StreamingParser. parseReply stays the only
+  // authority for sentence splitting, voice tags, and emotions.
   stream(sessionId: string, token: number, text: string): boolean {
     const session = this.session(sessionId);
     if (!session.enabled || session.generation !== token) return false;
@@ -87,16 +90,16 @@ export class SessionPlayback {
   }
 
   setEnabled(sessionId: string, enabled: boolean): void {
-    if (enabled) {
-      for (const [id, other] of this.sessions) {
-        if (id !== sessionId && other.enabled) this.setEnabled(id, false);
-      }
+    if (enabled && this.owner !== undefined && this.owner !== sessionId) {
+      this.setEnabled(this.owner, false);
     }
     const session = this.session(sessionId);
     if (session.enabled !== enabled) {
       session.enabled = enabled;
       this.onChange();
     }
+    if (enabled) this.owner = sessionId;
+    else if (this.owner === sessionId) this.owner = undefined;
     if (!enabled) this.stop(sessionId);
   }
 

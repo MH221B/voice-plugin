@@ -6,6 +6,7 @@ import threading
 
 from worker.delivery import delivery
 from worker.logging_utils import log_exception
+from worker.synthesis import RequestContext
 
 
 def pipeline_factory(language):
@@ -39,12 +40,44 @@ def prepare_runtime():
             os.environ.setdefault("PHONEMIZER_ESPEAK_DATA_PATH", os.path.dirname(espeakng_loader.get_data_path()))
 
 
+class KokoroBackend:
+    def __init__(self, pipeline_factory):
+        self.pipeline_factory = pipeline_factory
+        self.pipelines = {}
+
+    def units(self, units, config, context):
+        for unit in units:
+            if context.cancelled():
+                return
+            voice, speed = delivery(unit["emotions"], config["voice"], config["speed"])
+            language = voice[0]
+            if language not in self.pipelines:
+                self.pipelines[language] = self.pipeline_factory(language)
+            if context.cancelled():
+                return
+            for _, _, audio in self.pipelines[language](unit["text"], voice=voice, speed=speed):
+                if hasattr(audio, "numpy"):
+                    audio = audio.numpy()
+                yield audio, 24000
+
+
+class UnitBackend:
+    def __init__(self, backend):
+        self.backend = backend
+
+    def units(self, units, config, context):
+        reference = config.get("referenceAudio")
+        for unit in units:
+            if context.cancelled():
+                return
+            yield self.backend.synthesize(unit["text"], reference, context)
+
+
 class Worker:
     def __init__(self, output, pipeline_factory=pipeline_factory, stream_factory=stream_factory):
         self.output = output
-        self.pipeline_factory = pipeline_factory
         self.stream_factory = stream_factory
-        self.pipelines = {}
+        self.kokoro = KokoroBackend(pipeline_factory)
         self.chatterboxes = {}
         self.cosyvoice = None
         self.loaded_backend = None
@@ -56,6 +89,8 @@ class Worker:
         self.queue = queue.Queue(maxsize=32)
         self.playback_queue = queue.Queue(maxsize=1)
 
+    # Protocol output and request state share this lock. Stream abort and start
+    # also run under it, so slow output or device calls can delay state changes.
     def emit(self, response):
         with self.lock:
             self.output.write(json.dumps(response, ensure_ascii=False) + "\n")
@@ -207,6 +242,8 @@ class Worker:
         with self.lock:
             return request_id not in self.pending
 
+    # Called only from the synthesis thread. Backend adapters are reused here,
+    # so each request gets its own context instead of mutating adapter callbacks.
     def play_prefetched(self, request):
         request_id = request["id"]
         config = request["config"]
@@ -224,6 +261,7 @@ class Worker:
                 if request_id in self.pending and not stopped.is_set():
                     self.emit({"type": "diagnostic", "id": request_id, "message": message})
 
+        context = RequestContext(cancelled, diagnostic)
         try:
             if cancelled():
                 return
@@ -232,48 +270,30 @@ class Worker:
                 raise ValueError("CosyVoice requires a separate worker process")
             self.loaded_backend = backend
             if backend == "kokoro":
-                adapter = None
+                adapter = self.kokoro
             elif backend == "cosyvoice3":
                 from worker.cosyvoice_backend import CosyVoiceBackend
                 key = (config["cosyvoiceSource"], config["cosyvoiceModel"])
                 if self.cosyvoice is None:
-                    self.cosyvoice = (key, CosyVoiceBackend(*key, diagnostic))
+                    self.cosyvoice = (key, UnitBackend(CosyVoiceBackend(*key)))
                 if self.cosyvoice[0] != key:
                     raise ValueError("CosyVoice source or model changed; restart the worker")
                 adapter = self.cosyvoice[1]
             else:
                 from worker.chatterbox_backend import ChatterboxBackend
                 if backend not in self.chatterboxes:
-                    self.chatterboxes[backend] = ChatterboxBackend(backend == "chatterbox-nano", diagnostic)
+                    self.chatterboxes[backend] = UnitBackend(
+                        ChatterboxBackend(backend == "chatterbox-nano"))
                 adapter = self.chatterboxes[backend]
-            if adapter is not None:
-                adapter.cancelled = cancelled
-                adapter.diagnostic = diagnostic
-            for unit in request["units"]:
+            for audio, rate in adapter.units(request["units"], config, context):
+                while not cancelled():
+                    try:
+                        audio_queue.put((audio, rate), timeout=0.05)
+                        break
+                    except queue.Full:
+                        continue
                 if cancelled():
                     break
-                if backend == "kokoro":
-                    voice, speed = delivery(unit["emotions"], config["voice"], config["speed"])
-                    language = voice[0]
-                    if language not in self.pipelines:
-                        self.pipelines[language] = self.pipeline_factory(language)
-                    if cancelled():
-                        break
-                    chunks = ((audio, 24000) for _, _, audio in
-                              self.pipelines[language](unit["text"], voice=voice, speed=speed))
-                else:
-                    chunks = (adapter.synthesize(unit["text"], config.get("referenceAudio")),)
-                for audio, rate in chunks:
-                    if backend == "kokoro" and hasattr(audio, "numpy"):
-                        audio = audio.numpy()
-                    while not cancelled():
-                        try:
-                            audio_queue.put((audio, rate), timeout=0.05)
-                            break
-                        except queue.Full:
-                            continue
-                    if cancelled():
-                        break
         except Exception as exc:
             log_exception()
             errors.append(exc)
@@ -295,6 +315,8 @@ class Worker:
                     return
                 self.playback(job)
 
+        # One synthesis thread owns backend state; one playback thread owns the
+        # audio stream. Keep that split when changing cancellation or queues.
         synthesis_thread = threading.Thread(target=synthesize)
         playback_thread = threading.Thread(target=playback)
         synthesis_thread.start()

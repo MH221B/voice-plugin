@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 import tempfile
 import types
 import unittest
@@ -8,6 +9,7 @@ import torch
 
 from worker import conditioning_cache as cache
 from worker.chatterbox_backend import ChatterboxBackend
+from worker.synthesis import RequestContext
 
 
 class T3Cond:
@@ -44,7 +46,7 @@ class Model:
 
 class CacheTests(unittest.TestCase):
     def backend(self, nano=True, version="v1"):
-        backend = ChatterboxBackend(nano, lambda message: None)
+        backend = ChatterboxBackend(nano)
         backend.model = Model()
         backend.bundled_conds = backend.model.conds
         backend.device = "cpu"
@@ -90,44 +92,65 @@ class CacheTests(unittest.TestCase):
             self.assertEqual(len(d.model.prepared), 1)
             self.assertEqual(d.model.conds.t3.speaker_emb.item(), 4)
 
-    def test_gpu_fallback_restores_cached_voice_and_long_text_prepares_once(self):
+    def test_gpu_fallback_uses_real_load_and_restores_cached_voice(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(cache, "CACHE_DIR", Path(directory) / "cache"):
             reference = Path(directory) / "voice.wav"
             reference.write_text("7")
-            backend = self.backend()
-            backend.device = "cuda"
+
+            class GpuFailModel(Model):
+                def __init__(self, device):
+                    super().__init__()
+                    self.device = device
+
+                def generate(self, text, audio_prompt_path=None):
+                    if self.device == "cuda":
+                        raise RuntimeError("GPU failure")
+                    return super().generate(text, audio_prompt_path)
+
+            tts_turbo = types.SimpleNamespace(
+                __file__=str(Path(directory) / "tts_turbo.py"),
+                ChatterboxTurboTTS=types.SimpleNamespace(
+                    from_pretrained=lambda **kw: GpuFailModel(kw["device"])),
+                T3Cond=T3Cond, Conditionals=Conditionals,
+            )
+            Path(tts_turbo.__file__).write_text("")
+            diagnostics = []
             original_load = cache.load
+
             def load_cpu_cache(path, reference_hash, device, module):
                 return original_load(path, reference_hash, "cpu", module)
-            def fail(*args, **kwargs):
-                raise RuntimeError("GPU failure")
-            backend.model.generate = fail
-            loaded = []
-            def load(device):
-                loaded.append(device)
-                backend.model = Model()
-                backend.bundled_conds = backend.model.conds
-                backend.device = device
-                backend.conditioning_key = None
-            backend.load = load
-            with patch.object(cache, "load", side_effect=load_cpu_cache):
-                backend.synthesize("x" * 1500, str(reference))
-            self.assertEqual(loaded, ["cpu"])
+
+            with patch.dict(sys.modules, {"chatterbox": types.ModuleType("chatterbox"),
+                                          "chatterbox.tts_turbo": tts_turbo}), \
+                 patch.object(cache, "model_version", return_value="v1"), \
+                 patch.object(cache, "load", side_effect=load_cpu_cache):
+                backend = self.backend()
+                gpu_model = GpuFailModel("cuda")
+                backend.model = gpu_model
+                backend.bundled_conds = gpu_model.conds
+                backend.device = "cuda"
+                backend.synthesize("x" * 1500, str(reference),
+                                   RequestContext(diagnostic=diagnostics.append))
+            self.assertEqual(backend.device, "cpu")
+            self.assertEqual(gpu_model.prepared, [(str(reference), 0.0)])
             self.assertEqual(backend.model.prepared, [])
             self.assertEqual(backend.model.conds.t3.speaker_emb.item(), 7)
+            self.assertEqual(len(diagnostics), 1)
+            self.assertIn("retrying on CPU", diagnostics[0])
 
     def test_cancel_during_preparation_does_not_publish(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(cache, "CACHE_DIR", Path(directory) / "cache"):
             reference = Path(directory) / "voice.wav"
             reference.write_text("1")
             backend = self.backend()
+            cancelled = [False]
             prepare = backend.model.prepare_conditionals
             def cancel(*args, **kwargs):
                 prepare(*args, **kwargs)
-                backend.cancelled = lambda: True
+                cancelled[0] = True
             backend.model.prepare_conditionals = cancel
             with self.assertRaisesRegex(RuntimeError, "cancelled"):
-                backend.synthesize("hello", str(reference))
+                backend.synthesize("hello", str(reference), RequestContext(lambda: cancelled[0]))
             self.assertFalse(cache.cache_path(str(reference), True, "v1").exists())
 
     def test_failed_atomic_replace_keeps_previous_entry(self):
