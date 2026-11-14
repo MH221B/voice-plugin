@@ -61,11 +61,15 @@ return Plugin.define({
       const route = context.ui.router.current();
       return route.type === "session" ? route.sessionID : undefined;
     };
+    const isRoot = (id: string) => {
+      const session = context.data.session.get(id);
+      return session !== undefined && !session.parentID;
+    };
     const removeStatus = context.ui.slot({
       append: "prompt.footer.status",
       render: (input) => jsx("text", { get children() {
         revision();
-        return input.sessionID ? `Voice: ${playback.status(input.sessionID)}` : "";
+        return input.sessionID && isRoot(input.sessionID) ? `Voice: ${playback.status(input.sessionID)}` : "";
       } }),
     });
     const command = (action: (session: string) => void) => () => {
@@ -103,8 +107,12 @@ return Plugin.define({
         if (!execution || !step || step.finish !== "stop" || current() !== id) return;
         const revision = execution.revision;
         void (async () => {
-          try { await context.data.session.message.sync(id); } catch { return; }
-          if (disposed || current() !== id || executions.get(id) !== execution || execution.revision !== revision) return;
+          try {
+            if (!context.data.session.get(id)) await context.data.session.sync(id);
+            if (!isRoot(id)) return;
+            await context.data.session.message.sync(id);
+          } catch { return; }
+          if (disposed || current() !== id || !isRoot(id) || executions.get(id) !== execution || execution.revision !== revision) return;
           const matches = context.data.session.message.list(id).filter((message) => message.id === step.id);
           if (matches.length !== 1) return;
           const message = matches[0];

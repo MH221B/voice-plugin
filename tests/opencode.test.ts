@@ -18,6 +18,9 @@ function fixture(options: Record<string, unknown> = {}) {
   let route: ReturnType<Context["ui"]["router"]["current"]> = { type: "session", sessionID: "s" };
   let messages: SessionMessageInfo[] = [];
   let sync = async () => {};
+  let parentID: string | undefined;
+  let sessionKnown = true;
+  let syncSession = async () => {};
   let commands: readonly Command[] = [];
   let disposed = false;
   let statusRemoved = false;
@@ -29,7 +32,7 @@ function fixture(options: Record<string, unknown> = {}) {
       slot: (claim: Parameters<Context["ui"]["slot"]>[0]) => { statusSlot = claim; return () => { statusRemoved = true; }; } },
     keymap: { layer: (factory: () => { commands: readonly Command[] }) => { commands = factory().commands; } },
     data: { on: (type: string, handler: (event: never) => void) => { handlers.set(type, handler); return () => handlers.delete(type); },
-      session: { message: { sync: () => sync(), list: () => messages } } },
+      session: { get: () => sessionKnown ? { id: "s", parentID } : undefined, sync: () => syncSession(), message: { sync: () => sync(), list: () => messages } } },
   } as unknown as Context;
   const plugin = createPlugin((value) => { callbacks = value; return {
     send: (request) => { sent.push(request); return true; }, dispose: () => { disposed = true; },
@@ -47,6 +50,9 @@ function fixture(options: Record<string, unknown> = {}) {
     setRoute: (value: typeof route) => { route = value; },
     setMessages: (value: SessionMessageInfo[]) => { messages = value; },
     setSync: (value: typeof sync) => { sync = value; },
+    setParent: (value: string | undefined) => { parentID = value; },
+    setSessionKnown: (value: boolean) => { sessionKnown = value; },
+    setSessionSync: (value: typeof syncSession) => { syncSession = value; },
     disposed: () => disposed, callbacks: () => callbacks, statusSlot: () => statusSlot, statusRemoved: () => statusRemoved };
 }
 
@@ -59,6 +65,39 @@ function message(overrides: Partial<Extract<SessionMessageInfo, { type: "assista
     ], ...overrides };
 }
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test("does not speak a completed child session", async () => {
+  const f = fixture();
+  f.setParent("parent");
+  f.setMessages([message()]);
+  f.start(); f.step(); f.success(); await tick();
+  assert.equal(f.sent.length, 0);
+  f.cleanup?.();
+});
+
+test("resolves missing session metadata and fails closed", async () => {
+  for (const outcome of ["root", "child", "missing", "error"] as const) {
+    const f = fixture();
+    f.setSessionKnown(false);
+    f.setSessionSync(async () => {
+      if (outcome === "error") throw new Error("unavailable");
+      if (outcome !== "missing") f.setSessionKnown(true);
+      if (outcome === "child") f.setParent("parent");
+    });
+    f.setMessages([message()]); f.start(); f.step(); f.success(); await tick();
+    assert.equal(f.sent.length, outcome === "root" ? 1 : 0, outcome);
+    f.cleanup?.();
+  }
+});
+
+test("rechecks parent metadata after message sync", async () => {
+  const f = fixture();
+  f.setMessages([message()]);
+  f.setSync(async () => { f.setParent("parent"); });
+  f.start(); f.step(); f.success(); await tick();
+  assert.equal(f.sent.length, 0);
+  f.cleanup?.();
+});
 
 test("backend configuration selects Python and is sent with speech", async () => {
   const python = resolve("chatterbox-python");
