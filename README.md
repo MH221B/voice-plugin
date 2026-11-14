@@ -1,6 +1,6 @@
 # Voice plugin
 
-Local text-to-speech for completed OpenCode TUI replies on Windows. Choose Kokoro, Chatterbox Nano, or Chatterbox Turbo. Fenced code is skipped; the saved transcript is unchanged.
+Local text-to-speech for completed OpenCode TUI replies on Windows. Choose Kokoro, Chatterbox Nano, Chatterbox Turbo, or CosyVoice 3. Fenced code is skipped; the saved transcript is unchanged.
 
 ## How it works
 
@@ -53,6 +53,26 @@ Add the plugin to the global OpenCode TUI `cli.json` (not the server config). Re
 All options are optional. Kokoro is the default backend, with voice `af_heart`, speed `1.0`, and Python at `<projectRoot>\.venv\Scripts\python.exe`. Kokoro voice names must start with `af_`, `am_`, `bf_`, or `bm_`; speed must be between `0.7` and `1.3`.
 
 Model weights download on first use. Set `HF_TOKEN` before starting OpenCode to authenticate Hugging Face downloads; if it is unset or blank, downloads are anonymous even when a Hub login is cached. Cached models work without another download.
+
+## CosyVoice 3
+
+CosyVoice requires an existing local official source checkout, including its `third_party/Matcha-TTS` submodule, a local Fun-CosyVoice3-0.5B-2512 base model, and a separate compatible Python environment. The backend never downloads a model. The tested source revision is `074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc`. The experimental environment was copied and adapted rather than installed from a reproducible lockfile: Python 3.12, PyTorch `2.14.0+rocm10.1.0`, torchaudio `2.11.0.3+rocm10.1.0`, Transformers `4.51.3`, ONNX Runtime `1.22.1`, and OpenAI Whisper `20231117`. Other Windows AMD systems may require different packages. Do not install these into the Chatterbox environment.
+
+Configure absolute paths to your own local installation:
+
+```json
+{
+  "backend": "cosyvoice3",
+  "cosyvoicePython": "C:\\path\\to\\cosyvoice-env\\Scripts\\python.exe",
+  "cosyvoiceSource": "C:\\path\\to\\CosyVoice",
+  "cosyvoiceModel": "C:\\path\\to\\Fun-CosyVoice3-0.5B-2512",
+  "referenceAudio": "C:\\path\\to\\voice-reference.wav"
+}
+```
+
+Only clone a voice with permission. References must be at least one second at 16 kHz or higher; use a clean recording. For clips at least 20 seconds, seconds 10–20 are used; otherwise the first 10 seconds or the whole shorter clip is used. The original remains unchanged. Prepared reference features are held in memory and discarded when the worker exits.
+
+The model uses the available PyTorch GPU when supported, while ONNX reference processing may use CPU. The tested AMD 890M setup generated 4.8 seconds of audio in about 48 seconds with a 10-second reference, excluding model load; it emitted attention and MIOpen warnings. Synthesis cannot be interrupted mid-operation, but cancelled audio is suppressed. Kokoro voice, speed and emotion settings do not affect CosyVoice. The integrated output should be judged by listening.
 
 ## Chatterbox
 

@@ -24,9 +24,20 @@ return Plugin.define({
     const backend = options.backend ?? "kokoro";
     const referenceAudio = options.referenceAudio;
     const chatterboxPython = options.chatterboxPython;
-    if (backend !== "kokoro" && backend !== "chatterbox-nano" && backend !== "chatterbox-turbo") {
-      toast("Invalid backend: choose kokoro, chatterbox-nano, or chatterbox-turbo");
+    const cosyvoicePython = options.cosyvoicePython;
+    const cosyvoiceSource = options.cosyvoiceSource;
+    const cosyvoiceModel = options.cosyvoiceModel;
+    if (backend !== "kokoro" && backend !== "chatterbox-nano" && backend !== "chatterbox-turbo" && backend !== "cosyvoice3") {
+      toast("Invalid backend: choose kokoro, chatterbox-nano, chatterbox-turbo, or cosyvoice3");
       return;
+    }
+    if (backend === "cosyvoice3") {
+      for (const [name, value] of Object.entries({ referenceAudio, cosyvoicePython, cosyvoiceSource, cosyvoiceModel })) {
+        if (typeof value !== "string" || !isAbsolute(value)) {
+          toast(`${name} must be an absolute path for CosyVoice 3`);
+          return;
+        }
+      }
     }
     if (referenceAudio !== undefined && (typeof referenceAudio !== "string" || !isAbsolute(referenceAudio))) {
       toast("referenceAudio must be an absolute path");
@@ -46,12 +57,13 @@ return Plugin.define({
     let playback: SessionPlayback;
     let client: Client;
     try {
-      client = makeClient({ python: backend === "kokoro" ? python : (chatterboxPython ?? python), projectRoot: root,
+      client = makeClient({ python: backend === "kokoro" ? python : backend === "cosyvoice3" ? cosyvoicePython as string : (chatterboxPython ?? python), projectRoot: root,
         onTerminal: (session, id, response) => playback.finished(session, id, response),
         onFailure: (message) => toast(message),
         onDiagnostic: (message) => toast(message),
       });
-      playback = new SessionPlayback(client, { voice, speed, backend, ...(referenceAudio === undefined ? {} : { referenceAudio }) }, (_session, message) => toast(message), () => setRevision((value) => value + 1));
+      playback = new SessionPlayback(client, { voice, speed, backend, ...(referenceAudio === undefined ? {} : { referenceAudio }),
+        ...(backend === "cosyvoice3" ? { cosyvoiceSource: cosyvoiceSource as string, cosyvoiceModel: cosyvoiceModel as string } : {}) }, (_session, message) => toast(message), () => setRevision((value) => value + 1));
     } catch (error) {
       toast(`Voice worker failed: ${String(error)}`);
       return;

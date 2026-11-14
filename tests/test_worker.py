@@ -132,6 +132,53 @@ class WorkerTests(unittest.TestCase):
     def result(self, kind, id):
         self.assertEqual(self.output.queue.get(timeout=3), {"type": kind, "id": id})
 
+    def test_cosyvoice_routing_validation_and_order(self):
+        calls = []
+        class Adapter:
+            def __init__(self, source, model, diagnostic):
+                calls.append((source, model))
+            def synthesize(self, text, reference):
+                calls.append((text, reference))
+                return [text], 24000
+        with patch("worker.cosyvoice_backend.CosyVoiceBackend", Adapter):
+            self.start(lambda _: None, lambda rate: Audio(self.writes))
+            bad = speak("bad")
+            bad["config"]["backend"] = "cosyvoice3"
+            self.input.send(bad)
+            self.assertIn("referenceAudio", self.output.queue.get(timeout=2)["message"])
+            request = speak("good", ("one", "two"))
+            request["config"].update(backend="cosyvoice3", referenceAudio=os.path.abspath("ref.wav"),
+                                     cosyvoiceSource=os.path.abspath("source"), cosyvoiceModel=os.path.abspath("model"))
+            self.input.send(request)
+            self.result("done", "good")
+            self.assertEqual(self.writes, [["one"], ["two"]])
+            self.assertEqual(calls[0], (request["config"]["cosyvoiceSource"], request["config"]["cosyvoiceModel"]))
+            self.assertEqual([x[0] for x in calls[1:]], ["one", "two"])
+
+    def test_cosyvoice_cancel_suppresses_inflight_audio(self):
+        entered, release = threading.Event(), threading.Event()
+        class Adapter:
+            def __init__(self, source, model, diagnostic):
+                pass
+            def synthesize(self, text, reference):
+                entered.set()
+                release.wait(3)
+                return [text], 24000
+        with patch("worker.cosyvoice_backend.CosyVoiceBackend", Adapter):
+            self.start(lambda _: None, lambda rate: Audio(self.writes))
+            request = speak("cancel")
+            request["config"].update(backend="cosyvoice3", referenceAudio=os.path.abspath("ref.wav"),
+                                     cosyvoiceSource=os.path.abspath("source"), cosyvoiceModel=os.path.abspath("model"))
+            self.input.send(request)
+            self.assertTrue(entered.wait(2))
+            self.input.send({"type": "cancel", "id": "cancel"})
+            self.result("cancelled", "cancel")
+            release.set()
+            self.input.queue.put(None)
+            self.thread.join(timeout=3)
+            self.thread = None
+            self.assertEqual(self.writes, [])
+
     def test_order_and_cached_languages(self):
         languages = []
         def factory(language):

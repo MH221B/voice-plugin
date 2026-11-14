@@ -45,6 +45,8 @@ class Worker:
         self.stream_factory = stream_factory
         self.pipelines = {}
         self.chatterboxes = {}
+        self.cosyvoice = None
+        self.loaded_backend = None
         self.lock = threading.RLock()
         self.pending = {}
         self.seen = set()
@@ -99,11 +101,15 @@ class Worker:
             if not isinstance(config, dict):
                 raise ValueError("invalid config")
             backend = config.get("backend", "kokoro")
-            if backend not in ("kokoro", "chatterbox-nano", "chatterbox-turbo"):
-                raise ValueError("invalid backend: choose kokoro, chatterbox-nano, or chatterbox-turbo")
+            if backend not in ("kokoro", "chatterbox-nano", "chatterbox-turbo", "cosyvoice3"):
+                raise ValueError("invalid backend: choose kokoro, chatterbox-nano, chatterbox-turbo, or cosyvoice3")
             reference = config.get("referenceAudio")
             if reference is not None and (not isinstance(reference, str) or not os.path.isabs(reference)):
                 raise ValueError("referenceAudio must be an absolute path")
+            if backend == "cosyvoice3":
+                for name in ("referenceAudio", "cosyvoiceSource", "cosyvoiceModel"):
+                    if not isinstance(config.get(name), str) or not os.path.isabs(config[name]):
+                        raise ValueError(f"{name} must be an absolute path for CosyVoice 3")
             units = request.get("units")
             if not isinstance(units, list):
                 raise ValueError("invalid units")
@@ -135,6 +141,14 @@ class Worker:
             if request_id not in self.pending:
                 return
             self.active = request_id
+        backend = request["config"].get("backend", "kokoro")
+        if self.loaded_backend is not None and backend != self.loaded_backend and (
+                backend == "cosyvoice3" or self.loaded_backend == "cosyvoice3"):
+            self.terminal(request_id, "error", "CosyVoice requires a separate worker process")
+            with self.lock:
+                self.active = None
+            return
+        self.loaded_backend = backend
         if request["config"].get("backend", "kokoro") != "kokoro":
             self.play_chatterbox(request)
             return
@@ -221,7 +235,7 @@ class Worker:
                             self.stream = stream
                             stream.start()
                     if rate != current_rate:
-                        raise ValueError("Chatterbox sample rate changed within a request")
+                        raise ValueError("Speech sample rate changed within a request")
                     for offset in range(0, len(audio), 1200):
                         if cancelled():
                             return
@@ -243,10 +257,19 @@ class Worker:
         thread = threading.Thread(target=playback)
         thread.start()
         try:
-            from worker.chatterbox_backend import ChatterboxBackend
-            if backend not in self.chatterboxes:
-                self.chatterboxes[backend] = ChatterboxBackend(backend == "chatterbox-nano", diagnostic)
-            adapter = self.chatterboxes[backend]
+            if backend == "cosyvoice3":
+                from worker.cosyvoice_backend import CosyVoiceBackend
+                key = (config["cosyvoiceSource"], config["cosyvoiceModel"])
+                if self.cosyvoice is None:
+                    self.cosyvoice = (key, CosyVoiceBackend(*key, diagnostic))
+                if self.cosyvoice[0] != key:
+                    raise ValueError("CosyVoice source or model changed; restart the worker")
+                adapter = self.cosyvoice[1]
+            else:
+                from worker.chatterbox_backend import ChatterboxBackend
+                if backend not in self.chatterboxes:
+                    self.chatterboxes[backend] = ChatterboxBackend(backend == "chatterbox-nano", diagnostic)
+                adapter = self.chatterboxes[backend]
             adapter.cancelled = cancelled
             adapter.diagnostic = diagnostic
             for unit in request["units"]:

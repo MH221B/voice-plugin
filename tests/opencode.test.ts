@@ -115,7 +115,7 @@ test("backend configuration selects Python and is sent with speech", async () =>
 
 test("invalid backend paths and names report actionable errors", () => {
   for (const [options, expected] of [
-    [{ backend: "other" }, "Invalid backend: choose kokoro, chatterbox-nano, or chatterbox-turbo"],
+    [{ backend: "other" }, "Invalid backend: choose kokoro, chatterbox-nano, chatterbox-turbo, or cosyvoice3"],
     [{ referenceAudio: "relative.wav" }, "referenceAudio must be an absolute path"],
     [{ chatterboxPython: "python" }, "chatterboxPython must be an absolute path"],
   ] as const) {
@@ -123,6 +123,28 @@ test("invalid backend paths and names report actionable errors", () => {
     assert.deepEqual(f.toasts, [expected]);
     assert.equal(f.callbacks(), undefined);
   }
+});
+
+test("CosyVoice requires local paths and selects its own interpreter", async () => {
+  const options = { backend: "cosyvoice3", cosyvoicePython: resolve("cosy-python"),
+    cosyvoiceSource: resolve("cosy-source"), cosyvoiceModel: resolve("cosy-model"),
+    referenceAudio: resolve("reference.wav") };
+  for (const key of ["cosyvoicePython", "cosyvoiceSource", "cosyvoiceModel", "referenceAudio"] as const) {
+    const bad = fixture({ ...options, [key]: "relative" });
+    assert.match(bad.toasts[0], new RegExp(key));
+    assert.equal(bad.callbacks(), undefined);
+  }
+  const f = fixture(options);
+  assert.equal(f.callbacks()?.python, options.cosyvoicePython);
+  f.setMessages([message()]); f.start(); f.step(); f.success(); await tick();
+  const request = f.sent[0];
+  assert.equal(request.type, "speak");
+  if (request.type === "speak") {
+    assert.equal(request.config.cosyvoiceSource, options.cosyvoiceSource);
+    assert.equal(request.config.cosyvoiceModel, options.cosyvoiceModel);
+    assert.equal(request.config.referenceAudio, options.referenceAudio);
+  }
+  f.cleanup?.();
 });
 
 test("selects only the exact final completed answer and deduplicates success", async () => {

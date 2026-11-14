@@ -5,7 +5,7 @@ export type SpeechUnit = {
   emotions: Emotions;
   boundary: "sentence" | "span";
 };
-export type VoiceConfig = { voice: string; speed: number; backend?: "kokoro" | "chatterbox-nano" | "chatterbox-turbo"; referenceAudio?: string };
+export type VoiceConfig = { voice: string; speed: number; backend?: "kokoro" | "chatterbox-nano" | "chatterbox-turbo" | "cosyvoice3"; referenceAudio?: string; cosyvoiceSource?: string; cosyvoiceModel?: string };
 export type CompletedAnswer = { sessionId: string; answerId: string; text: string };
 
 export type WorkerRequest =
