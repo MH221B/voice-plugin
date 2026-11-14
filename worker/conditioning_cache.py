@@ -29,7 +29,8 @@ def model_version(model, module):
     for name in ("t3", "s3gen", "ve"):
         for key, tensor in sorted(getattr(model, name).state_dict().items()):
             digest.update(f"{name}.{key}:{tensor.dtype}:{tuple(tensor.shape)}".encode())
-            digest.update(tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
+            array = tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy()
+            digest.update(memoryview(array).cast("B"))
     return digest.hexdigest()
 
 
