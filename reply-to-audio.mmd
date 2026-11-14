@@ -5,11 +5,25 @@ sequenceDiagram
     participant Model as Voice model
     participant Audio as Audio device
 
-    TUI->>Plugin: Execution succeeds
-    Plugin->>Plugin: Select final reply and split into units
-    Plugin->>Worker: Speak request with units and config
-    Worker->>Model: Generate first unit
+    rect rgb(245, 245, 245)
+    Note over TUI,Plugin: Default path, streamSpeech off
+    TUI->>Plugin: session.execution.succeeded
+    Plugin->>Plugin: Sync and validate the final assistant message
+    Plugin->>Plugin: parseReply strips fenced code and splits units
+    Plugin->>Worker: speak(id, units, config)
+    Worker->>Worker: Enqueue, bounded at 32 requests
+    Worker->>Model: Synthesize unit 1
     Model-->>Worker: Audio
-    Worker->>Audio: Play audio
-    Note over Worker,Model: Chatterbox generates the next unit during playback
-    Worker-->>Plugin: Done, cancelled, or error
+    Worker->>Audio: Play while the next unit synthesizes
+    Note over Worker,Model: One synthesis thread feeds a one-slot playback queue
+    Worker-->>Plugin: done, cancelled, or error
+    end
+
+    opt streamSpeech on
+    TUI->>Plugin: Text deltas during generation
+    Plugin->>Plugin: StreamingParser exposes complete sentences only
+    Plugin->>Worker: speak per sentence, at most 32 active
+    Worker-->>Plugin: done, cancelled, or error per request
+    end
+
+    Note over Plugin,Worker: Cancellation is cooperative. Pending audio is dropped, the active stream is aborted, and an in-flight model call finishes before synthesis stops.

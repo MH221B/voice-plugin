@@ -1,8 +1,27 @@
 flowchart LR
-    A[OpenCode TUI] --> B[Select final reply]
-    B --> C[Clean text and split into speech units]
-    C --> D[Python worker]
-    D --> E[Kokoro]
-    D --> F[Chatterbox Nano / Turbo]
-    E --> G[Audio output]
-    F --> G
+    subgraph TUI["OpenCode TUI, TypeScript plugin"]
+        reply["Completed assistant reply"]
+        deltas["Assistant text deltas<br/>only when streamSpeech is on"]
+        validate["ReplyLifecycle<br/>sync and validate final message"]
+        parser["StreamingParser<br/>emit complete sentences"]
+        units["parseReply<br/>strip markup, split units"]
+        session["SessionPlayback<br/>generation token<br/>max 32 active streaming requests"]
+        reply --> validate --> units
+        deltas --> parser --> units
+        units --> session
+    end
+
+    session -->|"speak requests"| queue["Request queue<br/>bounded at 32"]
+
+    subgraph worker["Python worker"]
+        queue --> synth["Synthesis thread<br/>one backend at a time"]
+        synth --> kokoro["Kokoro"]
+        synth --> chatter["Chatterbox Nano / Turbo"]
+        synth --> cosy["CosyVoice 3"]
+        kokoro --> prefetch["Playback queue<br/>one slot"]
+        chatter --> prefetch
+        cosy --> prefetch
+        prefetch --> player["Playback thread<br/>sounddevice OutputStream"]
+    end
+
+    player --> audio["Audio device"]
