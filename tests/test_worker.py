@@ -222,6 +222,124 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.writes, [["first1"], ["first2"], ["second1"], ["second2"], ["third1"], ["third2"], ["one1"], ["one2"]])
         self.assertEqual(languages, ["a", "b"])
 
+    def test_kokoro_prefetch_overlap_delivery_and_rate(self):
+        playing, generated, release = threading.Event(), threading.Event(), threading.Event()
+        calls, rates = [], []
+
+        class Tensor:
+            def __init__(self, value):
+                self.value = value
+            def numpy(self):
+                return [self.value]
+
+        def factory(language):
+            def pipeline(text, **kwargs):
+                calls.append((language, text, kwargs))
+                yield None, None, Tensor(text + "1")
+                if text == "first":
+                    if playing.wait(2):
+                        generated.set()
+                    yield None, None, Tensor(text + "2")
+            return pipeline
+
+        class BlockingAudio(Audio):
+            def write(self, samples):
+                if samples == ["first1"]:
+                    playing.set()
+                    release.wait(3)
+                super().write(samples)
+
+        def stream(rate=24000):
+            rates.append(rate)
+            return BlockingAudio(self.writes)
+
+        self.start(factory, stream)
+        self.input.send(speak("kokoro-overlap", ("first", "second")))
+        try:
+            self.assertTrue(generated.wait(2))
+        finally:
+            release.set()
+        self.result("done", "kokoro-overlap")
+        self.assertEqual(self.writes, [["first1"], ["first2"], ["second1"]])
+        self.assertEqual(rates, [24000])
+        self.assertEqual(calls, [("a", "first", {"voice": "af_heart", "speed": 1}),
+                                 ("a", "second", {"voice": "af_heart", "speed": 1})])
+
+    def test_kokoro_cancel_at_write_boundary_discards_prefetch(self):
+        entered, prefetched, release = threading.Event(), threading.Event(), threading.Event()
+
+        def pipeline(text, **kwargs):
+            yield None, None, ["first"]
+            prefetched.set()
+            yield None, None, ["second"]
+
+        class BoundaryAudio(Audio):
+            def write(self, samples):
+                entered.set()
+                release.wait(3)
+                if not self.aborted.is_set():
+                    super().write(samples)
+
+        audio = BoundaryAudio(self.writes)
+        self.start(lambda _: pipeline, lambda: audio)
+        self.input.send(speak("boundary"))
+        try:
+            self.assertTrue(entered.wait(2))
+            self.assertTrue(prefetched.wait(2))
+            self.input.send({"type": "cancel", "id": "boundary"})
+            self.result("cancelled", "boundary")
+            self.assertTrue(audio.aborted.is_set())
+        finally:
+            release.set()
+        self.input.queue.put(None)
+        self.thread.join(timeout=3)
+        self.assertFalse(self.thread.is_alive())
+        self.thread = None
+        self.assertEqual(self.writes, [])
+        self.assertTrue(self.output.queue.empty())
+
+    def test_kokoro_synthesis_failure_drains_queued_audio(self):
+        playing, failed, release = threading.Event(), threading.Event(), threading.Event()
+
+        def pipeline(text, **kwargs):
+            yield None, None, ["first"]
+            playing.wait(2)
+            yield None, None, ["second"]
+            failed.set()
+            raise RuntimeError("synthesis failed")
+
+        class BlockingAudio(Audio):
+            def write(self, samples):
+                if samples == ["first"]:
+                    playing.set()
+                    release.wait(3)
+                super().write(samples)
+
+        self.start(lambda _: pipeline, lambda: BlockingAudio(self.writes))
+        self.input.send(speak("synthesis-error"))
+        try:
+            self.assertTrue(failed.wait(2))
+        finally:
+            release.set()
+        self.assertEqual(self.output.queue.get(timeout=3),
+                         {"type": "error", "id": "synthesis-error", "message": "synthesis failed"})
+        self.assertEqual(self.writes, [["first"], ["second"]])
+
+    def test_kokoro_playback_failure_stops_production(self):
+        class FailingAudio(Audio):
+            def write(self, samples):
+                raise RuntimeError("playback failed")
+
+        def pipeline(text, **kwargs):
+            for i in range(100):
+                yield None, None, [i]
+
+        self.start(lambda _: pipeline, lambda: FailingAudio(self.writes))
+        self.input.send(speak("playback-error"))
+        self.assertEqual(self.output.queue.get(timeout=3),
+                         {"type": "error", "id": "playback-error", "message": "playback failed"})
+        self.assertTrue(self.output.queue.empty())
+
     def test_queued_and_blocked_synthesis_cancellation(self):
         entered, release = threading.Event(), threading.Event()
         def pipeline(text, **kwargs):

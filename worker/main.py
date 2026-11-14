@@ -152,61 +152,12 @@ class Worker:
                 self.active = None
             return
         self.loaded_backend = backend
-        if request["config"].get("backend", "kokoro") != "kokoro":
-            self.play_chatterbox(request)
-            return
-        stream = None
-        try:
-            config = request["config"]
-            for unit in request["units"]:
-                with self.lock:
-                    if request_id not in self.pending:
-                        return
-                voice, speed = delivery(unit["emotions"], config["voice"], config["speed"])
-                language = voice[0]
-                if language not in self.pipelines:
-                    self.pipelines[language] = self.pipeline_factory(language)
-                with self.lock:
-                    if request_id not in self.pending:
-                        return
-                chunks = (audio for _, _, audio in self.pipelines[language](unit["text"], voice=voice, speed=speed))
-                for audio in chunks:
-                    with self.lock:
-                        if request_id not in self.pending:
-                            return
-                        if stream is None:
-                            stream = self.stream_factory()
-                            self.stream = stream
-                            stream.start()
-                    if hasattr(audio, "numpy"):
-                        audio = audio.numpy()
-                    for offset in range(0, len(audio), 1200):
-                        with self.lock:
-                            if request_id not in self.pending:
-                                return
-                        stream.write(audio[offset:offset + 1200])
-            if stream is not None:
-                # Drain queued audio without blocking the reader from aborting it.
-                stream.stop()
-            self.terminal(request_id, "done")
-        except Exception as exc:
-            log_exception()
-            self.terminal(request_id, "error", str(exc) or type(exc).__name__)
-        finally:
-            with self.lock:
-                self.stream = None
-                self.active = None
-            if stream is not None:
-                try:
-                    stream.close()
-                except Exception:
-                    log_exception()
-                    pass
+        self.play_prefetched(request)
 
-    def play_chatterbox(self, request):
+    def play_prefetched(self, request):
         request_id = request["id"]
         config = request["config"]
-        backend = config["backend"]
+        backend = config.get("backend", "kokoro")
         audio_queue = queue.Queue(maxsize=1)
         finished = threading.Event()
         errors = []
@@ -236,7 +187,7 @@ class Worker:
                             return
                         if stream is None:
                             rate = current_rate
-                            stream = self.stream_factory(rate)
+                            stream = self.stream_factory() if backend == "kokoro" else self.stream_factory(rate)
                             self.stream = stream
                             stream.start()
                     if rate != current_rate:
@@ -264,7 +215,9 @@ class Worker:
         thread = threading.Thread(target=playback)
         thread.start()
         try:
-            if backend == "cosyvoice3":
+            if backend == "kokoro":
+                adapter = None
+            elif backend == "cosyvoice3":
                 from worker.cosyvoice_backend import CosyVoiceBackend
                 key = (config["cosyvoiceSource"], config["cosyvoiceModel"])
                 if self.cosyvoice is None:
@@ -277,18 +230,34 @@ class Worker:
                 if backend not in self.chatterboxes:
                     self.chatterboxes[backend] = ChatterboxBackend(backend == "chatterbox-nano", diagnostic)
                 adapter = self.chatterboxes[backend]
-            adapter.cancelled = cancelled
-            adapter.diagnostic = diagnostic
+            if adapter is not None:
+                adapter.cancelled = cancelled
+                adapter.diagnostic = diagnostic
             for unit in request["units"]:
                 if cancelled() or finished.is_set():
                     break
-                audio, rate = adapter.synthesize(unit["text"], config.get("referenceAudio"))
-                while not cancelled() and not finished.is_set():
-                    try:
-                        audio_queue.put((audio, rate), timeout=0.05)
+                if backend == "kokoro":
+                    voice, speed = delivery(unit["emotions"], config["voice"], config["speed"])
+                    language = voice[0]
+                    if language not in self.pipelines:
+                        self.pipelines[language] = self.pipeline_factory(language)
+                    if cancelled() or finished.is_set():
                         break
-                    except queue.Full:
-                        continue
+                    chunks = ((audio, 24000) for _, _, audio in
+                              self.pipelines[language](unit["text"], voice=voice, speed=speed))
+                else:
+                    chunks = (adapter.synthesize(unit["text"], config.get("referenceAudio")),)
+                for audio, rate in chunks:
+                    if backend == "kokoro" and hasattr(audio, "numpy"):
+                        audio = audio.numpy()
+                    while not cancelled() and not finished.is_set():
+                        try:
+                            audio_queue.put((audio, rate), timeout=0.05)
+                            break
+                        except queue.Full:
+                            continue
+                    if cancelled() or finished.is_set():
+                        break
         except Exception as exc:
             log_exception()
             errors.append(exc)
