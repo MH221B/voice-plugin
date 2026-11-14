@@ -52,6 +52,12 @@ Add the plugin to the global OpenCode TUI `cli.json` (not the server config). Re
 
 All options are optional. Kokoro is the default backend, with voice `af_heart`, speed `1.0`, and Python at `<projectRoot>\.venv\Scripts\python.exe`. Kokoro voice names must start with `af_`, `am_`, `bf_`, or `bm_`; speed must be between `0.7` and `1.3`.
 
+### Experimental streaming
+
+Set `"streamSpeech": true` in the plugin options to opt in. It defaults to false. Streaming can speak intermediate, failed, retried or interrupted assistant text before the final reply is known. That text can quote sensitive content or tool inputs and outputs. Played audio cannot be recalled. Event validation is retrospective, so missing or reordered deltas can already have been spoken before a mismatch is detected. Do not enable this where that disclosure risk is unacceptable.
+
+The incremental parser supports common fenced and inline code, links, images, autolinks, URLs, emphasis, escapes, and non-nested voice tags. It withholds incomplete or unsupported constructs rather than guessing. Markdown can be reinterpreted by later input, such as a reference definition, so this is not a general safety filter for Markdown or sensitive model output. Streaming event ordering and text-part mapping have not yet been verified in a live OpenCode session. Cold worker startup and in-flight synthesis can delay playback and cancellation.
+
 Set `"log": true` in the plugin options and restart OpenCode to capture worker diagnostics and stderr in `<projectRoot>/.voice-cache/worker-*.log`. Logging defaults to false. Each worker has its own file, capped at 1 MiB with one 1 MiB `.log.1` backup; output may be dropped if logging cannot keep up. Logs are unredacted and may contain speech, paths, or secrets emitted by dependencies. Delete the `worker-*.log` and `worker-*.log.1` files to remove them.
 
 Model weights download on first use. Set `HF_TOKEN` before starting OpenCode to authenticate Hugging Face downloads; if it is unset or blank, downloads are anonymous even when a Hub login is cached. Cached models work without another download.

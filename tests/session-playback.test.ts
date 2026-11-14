@@ -72,3 +72,35 @@ test("status follows accepted requests and remains session scoped", () => {
   playback.setEnabled("a", true); assert.equal(playback.status("a"), "ON");
   assert.equal(playback.status("b"), "OFF"); assert.ok(changes > 0);
 });
+
+test("stream queue is ordered, bounded, and ignores stale callbacks", () => {
+  const sent: WorkerRequest[] = [];
+  const errors: string[] = [];
+  const playback = new SessionPlayback({ send: (request) => { sent.push(request); return true; } },
+    { voice: "af_heart", speed: 1 }, (_session, message) => errors.push(message));
+  playback.setEnabled("a", true);
+  const token = playback.token("a")!;
+  for (let i = 0; i < 32; i++) assert.equal(playback.stream("a", token, `Sentence ${i}.`), true);
+  assert.equal(playback.status("a"), "WORKING");
+  assert.equal(playback.stream("a", token, "Overflow."), false);
+  assert.equal(sent.filter((request) => request.type === "cancel").length, 32);
+  assert.deepEqual(errors, ["Voice streaming queue overflow"]);
+  const first = sent[0];
+  playback.finished("a", first.id, { type: "error", id: first.id, message: "stale" });
+  assert.deepEqual(errors, ["Voice streaming queue overflow"]);
+  assert.equal(playback.status("a"), "ON");
+});
+
+test("stream failure cancels other requests and reports once", () => {
+  const sent: WorkerRequest[] = [];
+  const errors: string[] = [];
+  const playback = new SessionPlayback({ send: (request) => { sent.push(request); return true; } },
+    { voice: "af_heart", speed: 1 }, (_session, message) => errors.push(message));
+  playback.setEnabled("a", true);
+  const token = playback.token("a")!;
+  playback.stream("a", token, "First."); playback.stream("a", token, "Second.");
+  playback.finished("a", sent[0].id, { type: "error", id: sent[0].id, message: "failed" });
+  playback.finished("a", sent[1].id, { type: "error", id: sent[1].id, message: "stale" });
+  assert.deepEqual(errors, ["failed"]);
+  assert.deepEqual(sent.slice(2), [{ type: "cancel", id: sent[1].id }]);
+});

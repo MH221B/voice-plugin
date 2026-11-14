@@ -265,6 +265,170 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(calls, [("a", "first", {"voice": "af_heart", "speed": 1}),
                                  ("a", "second", {"voice": "af_heart", "speed": 1})])
 
+    def test_streaming_requests_prefetch_during_prior_playback(self):
+        playing, synthesized, release = threading.Event(), threading.Event(), threading.Event()
+
+        def pipeline(text, **kwargs):
+            if text == "second":
+                synthesized.set()
+            yield None, None, [text]
+
+        class BlockingAudio(Audio):
+            def write(self, samples):
+                if samples == ["first"]:
+                    playing.set()
+                    release.wait(4)
+                super().write(samples)
+
+        self.start(lambda _: pipeline, lambda: BlockingAudio(self.writes))
+        self.input.send(speak("first", ("first",)))
+        try:
+            self.assertTrue(playing.wait(2))
+            self.input.send(speak("second", ("second",)))
+            self.assertTrue(synthesized.wait(1), "second request did not synthesize during first playback")
+            self.assertTrue(self.output.queue.empty(), "request completed before playback")
+        finally:
+            release.set()
+        self.result("done", "first")
+        self.result("done", "second")
+        self.assertEqual(self.writes, [["first"], ["second"]])
+
+    def test_streaming_cancel_prefetched_request_preserves_first_and_later_audio(self):
+        playing, synthesized, release = threading.Event(), threading.Event(), threading.Event()
+
+        def pipeline(text, **kwargs):
+            if text == "second":
+                synthesized.set()
+            yield None, None, [text]
+
+        class BlockingAudio(Audio):
+            def write(self, samples):
+                if samples == ["first"]:
+                    playing.set()
+                    release.wait(4)
+                super().write(samples)
+
+        self.start(lambda _: pipeline, lambda: BlockingAudio(self.writes))
+        self.input.send(speak("first", ("first",)))
+        try:
+            self.assertTrue(playing.wait(2))
+            self.input.send(speak("second", ("second",)))
+            self.assertTrue(synthesized.wait(2))
+            self.input.send({"type": "cancel", "id": "second"})
+            self.result("cancelled", "second")
+            self.input.send(speak("third", ("third",)))
+        finally:
+            release.set()
+        self.result("done", "first")
+        self.result("done", "third")
+        self.assertEqual(self.writes, [["first"], ["third"]])
+        self.assertTrue(self.output.queue.empty())
+
+    def test_streaming_prefetch_error_waits_for_prior_playback(self):
+        playing, failed, release = threading.Event(), threading.Event(), threading.Event()
+
+        def pipeline(text, **kwargs):
+            if text == "second":
+                failed.set()
+                raise RuntimeError("second synthesis failed")
+            yield None, None, [text]
+
+        class BlockingAudio(Audio):
+            def write(self, samples):
+                playing.set()
+                release.wait(4)
+                super().write(samples)
+
+        self.start(lambda _: pipeline, lambda: BlockingAudio(self.writes))
+        self.input.send(speak("first", ("first",)))
+        try:
+            self.assertTrue(playing.wait(2))
+            self.input.send(speak("second", ("second",)))
+            self.assertTrue(failed.wait(2))
+            self.assertTrue(self.output.queue.empty())
+        finally:
+            release.set()
+        self.result("done", "first")
+        self.assertEqual(self.output.queue.get(timeout=3),
+                         {"type": "error", "id": "second", "message": "second synthesis failed"})
+        self.assertEqual(self.writes, [["first"]])
+        self.assertTrue(self.output.queue.empty())
+
+    def test_streaming_cancel_active_and_prefetched_requests(self):
+        playing, synthesized = threading.Event(), threading.Event()
+
+        def pipeline(text, **kwargs):
+            if text == "second":
+                synthesized.set()
+            yield None, None, [text]
+
+        class BlockingAudio(Audio):
+            def write(self, samples):
+                playing.set()
+                self.aborted.wait(3)
+                if not self.aborted.is_set():
+                    super().write(samples)
+
+        audio = BlockingAudio(self.writes)
+        self.start(lambda _: pipeline, lambda: audio)
+        self.input.send(speak("first", ("first",)))
+        self.assertTrue(playing.wait(2))
+        self.input.send(speak("second", ("second",)))
+        self.assertTrue(synthesized.wait(2))
+        # Cancel the prefetched request first, so releasing the active write
+        # cannot race the cancellation of its successor.
+        self.input.send({"type": "cancel", "id": "second"})
+        self.result("cancelled", "second")
+        self.input.send({"type": "cancel", "id": "first"})
+        self.result("cancelled", "first")
+        self.assertTrue(audio.aborted.is_set())
+        self.input.queue.put(None)
+        self.thread.join(timeout=3)
+        self.assertFalse(self.thread.is_alive())
+        self.thread = None
+        self.assertEqual(self.writes, [])
+        self.assertTrue(self.output.queue.empty())
+
+    def test_streaming_prefetch_preserves_request_sample_rates(self):
+        playing, synthesized, release = threading.Event(), threading.Event(), threading.Event()
+        rates = []
+
+        class FakeBackend:
+            def __init__(self, nano, diagnostic):
+                pass
+            def synthesize(self, text, reference):
+                if text == "second":
+                    synthesized.set()
+                return [text], 16000 if text == "first" else 24000
+
+        class BlockingAudio(Audio):
+            def write(self, samples):
+                if samples == ["first"]:
+                    playing.set()
+                    release.wait(4)
+                super().write(samples)
+
+        def stream(rate):
+            rates.append(rate)
+            return BlockingAudio(self.writes)
+
+        with patch("worker.chatterbox_backend.ChatterboxBackend", FakeBackend):
+            self.start(lambda _: None, stream)
+            first = speak("first", ("first",))
+            second = speak("second", ("second",))
+            first["config"]["backend"] = second["config"]["backend"] = "chatterbox-nano"
+            self.input.send(first)
+            try:
+                self.assertTrue(playing.wait(2))
+                self.input.send(second)
+                self.assertTrue(synthesized.wait(2))
+            finally:
+                release.set()
+            self.result("done", "first")
+            self.result("done", "second")
+            self.assertEqual(rates, [16000, 24000])
+            self.assertEqual(self.writes, [["first"], ["second"]])
+
     def test_kokoro_cancel_at_write_boundary_discards_prefetch(self):
         entered, prefetched, release = threading.Event(), threading.Event(), threading.Event()
 

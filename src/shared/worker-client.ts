@@ -44,6 +44,7 @@ export class WorkerClient {
 
   send(request: WorkerRequest): boolean {
     if (this.dead) return false;
+    if (request.type === "cancel") this.pending.delete(request.id);
     if (request.type === "speak") {
       if (this.pending.has(request.id)) return false;
       this.pending.set(request.id, request.sessionId);

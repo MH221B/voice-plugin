@@ -53,7 +53,8 @@ class Worker:
         self.seen = set()
         self.active = None
         self.stream = None
-        self.queue = queue.Queue()
+        self.queue = queue.Queue(maxsize=32)
+        self.playback_queue = queue.Queue(maxsize=1)
 
     def emit(self, response):
         with self.lock:
@@ -127,7 +128,10 @@ class Worker:
                     return
                 self.seen.add(request_id)
                 self.pending[request_id] = request
-                self.queue.put(request)
+                try:
+                    self.queue.put_nowait(request)
+                except queue.Full:
+                    self.terminal(request_id, "error", "Speech request queue overflow")
         except (ValueError, TypeError, OverflowError) as exc:
             log_exception()
             with self.lock:
@@ -143,78 +147,90 @@ class Worker:
         with self.lock:
             if request_id not in self.pending:
                 return
-            self.active = request_id
-        backend = request["config"].get("backend", "kokoro")
-        if self.loaded_backend is not None and backend != self.loaded_backend and (
-                backend == "cosyvoice3" or self.loaded_backend == "cosyvoice3"):
-            self.terminal(request_id, "error", "CosyVoice requires a separate worker process")
-            with self.lock:
-                self.active = None
-            return
-        self.loaded_backend = backend
         self.play_prefetched(request)
+
+    def playback(self, job):
+        request = job["request"]
+        request_id = request["id"]
+        backend = request["config"].get("backend", "kokoro")
+        stream = None
+        rate = None
+        try:
+            with self.lock:
+                if request_id not in self.pending:
+                    return
+                self.active = request_id
+            while not self.cancelled(request_id):
+                try:
+                    audio, current_rate = job["audio"].get(timeout=0.05)
+                except queue.Empty:
+                    if job["finished"].is_set():
+                        break
+                    continue
+                with self.lock:
+                    if request_id not in self.pending:
+                        return
+                    if stream is None:
+                        rate = current_rate
+                        stream = self.stream_factory() if backend == "kokoro" else self.stream_factory(rate)
+                        self.stream = stream
+                        stream.start()
+                if rate != current_rate:
+                    raise ValueError("Speech sample rate changed within a request")
+                for offset in range(0, len(audio), 1200):
+                    if self.cancelled(request_id):
+                        return
+                    stream.write(audio[offset:offset + 1200])
+            if stream is not None and not self.cancelled(request_id):
+                stream.stop()
+        except Exception as exc:
+            log_exception()
+            job["errors"].append(exc)
+            job["stopped"].set()
+        finally:
+            with self.lock:
+                if self.active == request_id:
+                    self.active = None
+                    self.stream = None
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    log_exception()
+            errors = job["errors"]
+            if errors:
+                self.terminal(request_id, "error", str(errors[0]) or type(errors[0]).__name__)
+            else:
+                self.terminal(request_id, "done")
+
+    def cancelled(self, request_id):
+        with self.lock:
+            return request_id not in self.pending
 
     def play_prefetched(self, request):
         request_id = request["id"]
         config = request["config"]
         backend = config.get("backend", "kokoro")
-        audio_queue = queue.Queue(maxsize=1)
-        finished = threading.Event()
-        errors = []
+        job = {"request": request, "audio": queue.Queue(maxsize=1),
+               "finished": threading.Event(), "stopped": threading.Event(), "errors": []}
+        self.playback_queue.put(job)
+        audio_queue, finished, stopped, errors = job["audio"], job["finished"], job["stopped"], job["errors"]
 
         def cancelled():
-            with self.lock:
-                return request_id not in self.pending
+            return self.cancelled(request_id) or stopped.is_set()
 
         def diagnostic(message):
             with self.lock:
-                if request_id in self.pending:
+                if request_id in self.pending and not stopped.is_set():
                     self.emit({"type": "diagnostic", "id": request_id, "message": message})
 
-        def playback():
-            stream = None
-            rate = None
-            try:
-                while not cancelled():
-                    try:
-                        audio, current_rate = audio_queue.get(timeout=0.05)
-                    except queue.Empty:
-                        if finished.is_set():
-                            break
-                        continue
-                    with self.lock:
-                        if request_id not in self.pending:
-                            return
-                        if stream is None:
-                            rate = current_rate
-                            stream = self.stream_factory() if backend == "kokoro" else self.stream_factory(rate)
-                            self.stream = stream
-                            stream.start()
-                    if rate != current_rate:
-                        raise ValueError("Speech sample rate changed within a request")
-                    for offset in range(0, len(audio), 1200):
-                        if cancelled():
-                            return
-                        stream.write(audio[offset:offset + 1200])
-                if stream is not None and not cancelled():
-                    stream.stop()
-            except Exception as exc:
-                log_exception()
-                errors.append(exc)
-                finished.set()
-            finally:
-                with self.lock:
-                    self.stream = None
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except Exception:
-                        log_exception()
-                        pass
-
-        thread = threading.Thread(target=playback)
-        thread.start()
         try:
+            if cancelled():
+                return
+            if self.loaded_backend is not None and backend != self.loaded_backend and (
+                    backend == "cosyvoice3" or self.loaded_backend == "cosyvoice3"):
+                raise ValueError("CosyVoice requires a separate worker process")
+            self.loaded_backend = backend
             if backend == "kokoro":
                 adapter = None
             elif backend == "cosyvoice3":
@@ -234,14 +250,14 @@ class Worker:
                 adapter.cancelled = cancelled
                 adapter.diagnostic = diagnostic
             for unit in request["units"]:
-                if cancelled() or finished.is_set():
+                if cancelled():
                     break
                 if backend == "kokoro":
                     voice, speed = delivery(unit["emotions"], config["voice"], config["speed"])
                     language = voice[0]
                     if language not in self.pipelines:
                         self.pipelines[language] = self.pipeline_factory(language)
-                    if cancelled() or finished.is_set():
+                    if cancelled():
                         break
                     chunks = ((audio, 24000) for _, _, audio in
                               self.pipelines[language](unit["text"], voice=voice, speed=speed))
@@ -250,37 +266,39 @@ class Worker:
                 for audio, rate in chunks:
                     if backend == "kokoro" and hasattr(audio, "numpy"):
                         audio = audio.numpy()
-                    while not cancelled() and not finished.is_set():
+                    while not cancelled():
                         try:
                             audio_queue.put((audio, rate), timeout=0.05)
                             break
                         except queue.Full:
                             continue
-                    if cancelled() or finished.is_set():
+                    if cancelled():
                         break
         except Exception as exc:
             log_exception()
             errors.append(exc)
         finally:
             finished.set()
-            thread.join()
-            with self.lock:
-                self.active = None
-            if errors:
-                self.terminal(request_id, "error", str(errors[0]) or type(errors[0]).__name__)
-            else:
-                self.terminal(request_id, "done")
 
     def run(self, input_stream):
-        def playback():
+        def synthesize():
             while True:
                 request = self.queue.get()
                 if request is None:
                     return
                 self.play(request)
 
-        thread = threading.Thread(target=playback)
-        thread.start()
+        def playback():
+            while True:
+                job = self.playback_queue.get()
+                if job is None:
+                    return
+                self.playback(job)
+
+        synthesis_thread = threading.Thread(target=synthesize)
+        playback_thread = threading.Thread(target=playback)
+        synthesis_thread.start()
+        playback_thread.start()
         self.emit({"type": "ready"})
         try:
             for line in input_stream:
@@ -290,7 +308,9 @@ class Worker:
                 for request_id in list(self.pending):
                     self.cancel(request_id)
             self.queue.put(None)
-            thread.join()
+            synthesis_thread.join()
+            self.playback_queue.put(None)
+            playback_thread.join()
 
 
 def main():

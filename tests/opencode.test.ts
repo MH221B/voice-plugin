@@ -66,6 +66,88 @@ function message(overrides: Partial<Extract<SessionMessageInfo, { type: "assista
 }
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+test("streaming speaks before success and reconciles the final tail", async () => {
+  const f = fixture({ streamSpeech: true });
+  f.commands[0].run();
+  f.start();
+  f.emit("session.step.started", { sessionID: "s", assistantMessageID: "answer", agent: "agent", model: { providerID: "p", id: "m" }, started: 1 });
+  f.emit("session.text.started", { sessionID: "s", assistantMessageID: "answer", ordinal: 0 });
+  f.emit("session.text.delta", { sessionID: "s", assistantMessageID: "answer", ordinal: 0, delta: "Hello. Tail" });
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].type, "speak");
+  if (f.sent[0].type === "speak") assert.equal(f.sent[0].units[0].text, "Hello.");
+  f.emit("session.text.ended", { sessionID: "s", assistantMessageID: "answer", ordinal: 0, text: "Hello. Tail" });
+  f.setMessages([message({ content: [{ type: "reasoning", text: "secret" }, { type: "text", text: "Hello. Tail" }] })]);
+  f.step(); f.success(); await tick();
+  assert.equal(f.sent.length, 2);
+  if (f.sent[1].type === "speak") assert.equal(f.sent[1].units[0].text, "Tail");
+  f.cleanup?.();
+});
+
+test("streaming mismatch and stop cancel queued speech and suppress later deltas", () => {
+  for (const stop of ["mismatch", "command"] as const) {
+    const f = fixture({ streamSpeech: true }); f.commands[0].run(); f.start();
+    f.emit("session.step.started", { sessionID: "s", assistantMessageID: "answer", agent: "agent", model: { providerID: "p", id: "m" }, started: 1 });
+    f.emit("session.text.started", { sessionID: "s", assistantMessageID: "answer", ordinal: 0 });
+    f.emit("session.text.delta", { sessionID: "s", assistantMessageID: "answer", ordinal: 0, delta: "Hello. " });
+    if (stop === "command") f.commands[2].run();
+    else f.emit("session.text.ended", { sessionID: "s", assistantMessageID: "answer", ordinal: 0, text: "different" });
+    f.emit("session.text.delta", { sessionID: "s", assistantMessageID: "answer", ordinal: 0, delta: "Later. " });
+    assert.deepEqual(f.sent.map((request) => request.type), ["speak", "cancel"]);
+    f.cleanup?.();
+  }
+});
+
+test("streaming invalid finishes cancel without waiting for execution end", () => {
+  for (const finish of ["tool-calls", "error", "content-filter", "length", "unknown"] as const) {
+    const f = fixture({ streamSpeech: true }); f.commands[0].run(); f.start();
+    f.emit("session.step.started", { sessionID: "s", assistantMessageID: "answer", agent: "agent", model: { providerID: "p", id: "m" }, started: 1 });
+    f.emit("session.text.started", { sessionID: "s", assistantMessageID: "answer", ordinal: 0 });
+    f.emit("session.text.delta", { sessionID: "s", assistantMessageID: "answer", ordinal: 0, delta: "Hello. " });
+    f.emit("session.text.ended", { sessionID: "s", assistantMessageID: "answer", ordinal: 0, text: "Hello. " });
+    f.emit("session.step.ended", { sessionID: "s", assistantMessageID: "answer", finish, cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } });
+    assert.deepEqual(f.sent.map((request) => request.type), ["speak", "cancel"], finish);
+    f.cleanup?.();
+  }
+});
+
+test("final synchronization mismatch cancels streamed requests", async () => {
+  const f = fixture({ streamSpeech: true }); f.commands[0].run(); f.start();
+  f.emit("session.step.started", { sessionID: "s", assistantMessageID: "answer", agent: "agent", model: { providerID: "p", id: "m" }, started: 1 });
+  f.emit("session.text.started", { sessionID: "s", assistantMessageID: "answer", ordinal: 0 });
+  f.emit("session.text.delta", { sessionID: "s", assistantMessageID: "answer", ordinal: 0, delta: "Hello. Tail" });
+  f.emit("session.text.ended", { sessionID: "s", assistantMessageID: "answer", ordinal: 0, text: "Hello. Tail" });
+  f.setMessages([message()]); f.step(); f.success(); await tick();
+  assert.deepEqual(f.sent.map((request) => request.type), ["speak", "cancel"]);
+  f.cleanup?.();
+});
+
+test("missing middle delta can be spoken before end-event mismatch cancels it", () => {
+  const f = fixture({ streamSpeech: true }); f.commands[0].run(); f.start();
+  f.emit("session.step.started", { sessionID: "s", assistantMessageID: "answer", agent: "agent", model: { providerID: "p", id: "m" }, started: 1 });
+  f.emit("session.text.started", { sessionID: "s", assistantMessageID: "answer", ordinal: 0 });
+  f.emit("session.text.delta", { sessionID: "s", assistantMessageID: "answer", ordinal: 0, delta: "This works. " });
+  f.emit("session.text.ended", { sessionID: "s", assistantMessageID: "answer", ordinal: 0, text: "This never works. " });
+  assert.deepEqual(f.sent.map((request) => request.type), ["speak", "cancel"]);
+  f.cleanup?.();
+});
+
+test("streaming requires root identity at execution start and survives navigation", () => {
+  const unknown = fixture({ streamSpeech: true }); unknown.commands[0].run(); unknown.setSessionKnown(false); unknown.start();
+  unknown.setSessionKnown(true);
+  unknown.emit("session.step.started", { sessionID: "s", assistantMessageID: "answer", agent: "agent", model: { providerID: "p", id: "m" }, started: 1 });
+  unknown.emit("session.text.started", { sessionID: "s", assistantMessageID: "answer", ordinal: 0 });
+  unknown.emit("session.text.delta", { sessionID: "s", assistantMessageID: "answer", ordinal: 0, delta: "No suffix. " });
+  assert.equal(unknown.sent.length, 0); unknown.cleanup?.();
+
+  const background = fixture({ streamSpeech: true }); background.commands[0].run(); background.start();
+  background.setRoute({ type: "session", sessionID: "other" });
+  background.emit("session.step.started", { sessionID: "s", assistantMessageID: "answer", agent: "agent", model: { providerID: "p", id: "m" }, started: 1 });
+  background.emit("session.text.started", { sessionID: "s", assistantMessageID: "answer", ordinal: 0 });
+  background.emit("session.text.delta", { sessionID: "s", assistantMessageID: "answer", ordinal: 0, delta: "Background works. " });
+  assert.equal(background.sent[0].type, "speak"); background.cleanup?.();
+});
+
 test("enabled session speaks completed replies while viewing another session", async () => {
   const f = fixture();
   f.commands[0].run();
