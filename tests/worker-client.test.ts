@@ -18,13 +18,13 @@ class FakeChild extends EventEmitter {
   kill() { this.killed = true; return true; }
 }
 
-function fixture() {
+function fixture(backend?: "kokoro" | "chatterbox-nano" | "chatterbox-turbo" | "cosyvoice3") {
   const child = new FakeChild();
   const terminal: [string, string, WorkerResponse][] = [];
   const failures: string[] = [];
   const diagnostics: string[] = [];
   let args: unknown[] = [];
-  const client = new WorkerClient({ python: "absolute-python", projectRoot: "absolute-root",
+  const client = new WorkerClient({ python: "absolute-python", projectRoot: "absolute-root", backend,
     spawn: ((...values: unknown[]) => { args = values; return child; }) as unknown as typeof spawn,
     onTerminal: (session, id, response) => terminal.push([session, id, response]),
     onFailure: (message) => failures.push(message),
@@ -34,6 +34,22 @@ function fixture() {
     units: [{ text: "Hello", emotions: {}, boundary: "sentence" }], config: { voice: "af_heart", speed: 1 } });
   return { child, client, terminal, failures, diagnostics, speak, args };
 }
+
+test("startup passes the configured backend and mismatch is request-scoped", () => {
+  for (const backend of ["kokoro", "chatterbox-nano", "chatterbox-turbo", "cosyvoice3"] as const) {
+    const { args, child, client, terminal, failures, speak } = fixture(backend);
+    assert.deepEqual(args.slice(0, 2), ["absolute-python", ["-m", "worker.main", backend]]);
+    client.send(speak("bad"));
+    client.send(speak("good"));
+    child.stdout.write('{"type":"ready"}\n');
+    child.stdout.write('{"type":"error","id":"bad","message":"backend mismatch"}\n');
+    child.stdout.write('{"type":"done","id":"good"}\n');
+    assert.deepEqual(terminal, [["session", "bad", { type: "error", id: "bad", message: "backend mismatch" }],
+      ["session", "good", { type: "done", id: "good" }]]);
+    assert.deepEqual(failures, []);
+    client.dispose();
+  }
+});
 
 test("diagnostics are nonterminal and stale diagnostics are ignored", () => {
   const { child, client, terminal, failures, diagnostics, speak } = fixture();
@@ -52,7 +68,7 @@ test("diagnostics are nonterminal and stale diagnostics are ignored", () => {
 
 test("buffers until readiness, parses split lines and routes terminal responses once", () => {
   const { child, client, terminal, failures, speak, args } = fixture();
-  assert.deepEqual(args.slice(0, 2), ["absolute-python", ["-m", "worker.main"]]);
+  assert.deepEqual(args.slice(0, 2), ["absolute-python", ["-m", "worker.main", "kokoro"]]);
   assert.equal((args[2] as { cwd: string }).cwd, "absolute-root");
   assert.equal(client.send(speak("a", "one")), true);
   assert.equal(client.send(speak("b", "two")), true);

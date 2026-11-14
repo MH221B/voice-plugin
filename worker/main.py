@@ -19,12 +19,12 @@ def stream_factory(samplerate=24000):
     return sounddevice.OutputStream(samplerate=samplerate, channels=1, dtype="float32")
 
 
-def prepare_runtime():
+def prepare_runtime(backend="kokoro"):
     # NumPy's Windows native import can stall when first loaded on the playback thread.
     import numpy  # noqa: F401
 
     # Chatterbox's native imports can also stall on that thread on Windows.
-    if sys.platform == "win32":
+    if sys.platform == "win32" and backend in ("chatterbox-nano", "chatterbox-turbo"):
         import importlib.util
         if importlib.util.find_spec("chatterbox") is not None:
             from chatterbox import tts_turbo  # noqa: F401
@@ -74,8 +74,9 @@ class UnitBackend:
 
 
 class Worker:
-    def __init__(self, output, pipeline_factory=pipeline_factory, stream_factory=stream_factory):
+    def __init__(self, output, pipeline_factory=pipeline_factory, stream_factory=stream_factory, backend="kokoro"):
         self.output = output
+        self.backend = backend
         self.stream_factory = stream_factory
         self.kokoro = KokoroBackend(pipeline_factory)
         self.chatterboxes = {}
@@ -141,6 +142,8 @@ class Worker:
             backend = config.get("backend", "kokoro")
             if backend not in ("kokoro", "chatterbox-nano", "chatterbox-turbo", "cosyvoice3"):
                 raise ValueError("invalid backend: choose kokoro, chatterbox-nano, chatterbox-turbo, or cosyvoice3")
+            if backend != self.backend:
+                raise ValueError(f"worker backend is {self.backend}, not {backend}")
             reference = config.get("referenceAudio")
             if reference is not None and (not isinstance(reference, str) or not os.path.isabs(reference)):
                 raise ValueError("referenceAudio must be an absolute path")
@@ -342,13 +345,18 @@ def main():
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     sys.stdout = sys.stderr
     try:
-        prepare_runtime()
+        if len(sys.argv) > 2:
+            raise ValueError("expected at most one backend argument")
+        backend = sys.argv[1] if len(sys.argv) == 2 else "kokoro"
+        if backend not in ("kokoro", "chatterbox-nano", "chatterbox-turbo", "cosyvoice3"):
+            raise ValueError("invalid startup backend")
+        prepare_runtime(backend)
     except Exception as exc:
         log_exception()
         protocol_output.write(json.dumps({"type": "error", "message": str(exc) or type(exc).__name__}) + "\n")
         protocol_output.flush()
         return
-    Worker(protocol_output).run(sys.stdin)
+    Worker(protocol_output, backend=backend).run(sys.stdin)
 
 
 if __name__ == "__main__":

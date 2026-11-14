@@ -64,12 +64,40 @@ class Audio:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_startup_backend_controls_windows_preload(self):
+        import builtins
+        real_import = builtins.__import__
+        for platform in ("win32", "linux"):
+            for backend in ("kokoro", "cosyvoice3", "chatterbox-nano", "chatterbox-turbo"):
+                calls = []
+                def importing(name, globals=None, locals=None, fromlist=(), level=0):
+                    if name == "chatterbox":
+                        calls.append((threading.current_thread().name, fromlist))
+                        return types.SimpleNamespace(tts_turbo=object())
+                    return real_import(name, globals, locals, fromlist, level)
+                with patch.dict(sys.modules, {"numpy": types.ModuleType("numpy")}), \
+                     patch("worker.main.sys.platform", platform), \
+                     patch("importlib.util.find_spec", return_value=object()), \
+                     patch.dict(os.environ, {"PHONEMIZER_ESPEAK_LIBRARY": "custom.dll"}), \
+                     patch("builtins.__import__", side_effect=importing):
+                    prepare_runtime(backend)
+                expected = platform == "win32" and backend.startswith("chatterbox-")
+                self.assertEqual(bool(calls), expected, (platform, backend))
+                if expected:
+                    self.assertEqual(calls[0][0], "MainThread")
+                    self.assertIn("tts_turbo", calls[0][1])
+
+    def test_invalid_startup_backend_errors_before_ready(self):
+        process = subprocess.run([sys.executable, "-m", "worker.main", "invalid"],
+                                 input="", capture_output=True, text=True, timeout=10)
+        self.assertEqual(json.loads(process.stdout), {"type": "error", "message": "invalid startup backend"})
+
     def test_worker_stdin_decodes_utf8_protocol(self):
         script = """
 import json, sys
 from worker import main
 sys.stdin.reconfigure(encoding="cp1252")
-main.prepare_runtime = lambda: None
+main.prepare_runtime = lambda backend: None
 def run(self, stream):
     request = json.loads(stream.readline())
     self.emit({"type": "diagnostic", "id": request["id"], "message": request["units"][0]["text"]})
@@ -121,10 +149,14 @@ main.main()
             env = os.environ.copy()
             env["NUMPY_MARKER"] = str(marker)
             env["PYTHONPATH"] = directory + os.pathsep + env.get("PYTHONPATH", "")
-            process = subprocess.run([sys.executable, "-m", "worker.main"], input="", capture_output=True,
+            request = speak("mismatch")
+            request["config"]["backend"] = "chatterbox-nano"
+            process = subprocess.run([sys.executable, "-m", "worker.main"], input=json.dumps(request) + "\n", capture_output=True,
                                      text=True, env=env, timeout=10)
             self.assertEqual(process.returncode, 0, process.stderr)
-            self.assertEqual(json.loads(process.stdout), {"type": "ready"})
+            self.assertEqual([json.loads(line) for line in process.stdout.splitlines()],
+                             [{"type": "ready"}, {"type": "error", "id": "mismatch",
+                              "message": "worker backend is kokoro, not chatterbox-nano"}])
             self.assertEqual(marker.read_text(encoding="utf-8"), "MainThread")
 
     def test_numpy_startup_failure_is_protocol_error(self):
@@ -138,6 +170,36 @@ main.main()
 
 
 class WorkerTests(unittest.TestCase):
+    def test_backend_mismatch_and_duplicate_do_not_interrupt_active_request(self):
+        entered, release = threading.Event(), threading.Event()
+        def pipeline(text, **kwargs):
+            if text == "one":
+                entered.set()
+                release.wait(3)
+            yield None, None, [text]
+        self.start(lambda _: pipeline)
+        self.input.send(speak("active"))
+        self.assertTrue(entered.wait(2))
+        duplicate = speak("active")
+        duplicate["config"]["backend"] = "cosyvoice3"
+        self.input.send(duplicate)
+        mismatch = speak("mismatch")
+        mismatch["config"]["backend"] = "chatterbox-nano"
+        self.input.send(mismatch)
+        try:
+            self.assertEqual(self.output.queue.get(timeout=2),
+                             {"type": "error", "id": "mismatch",
+                              "message": "worker backend is kokoro, not chatterbox-nano"})
+            self.input.send(speak("mismatch", ("corrected",)))
+            self.input.send(speak("valid", ("two",)))
+        finally:
+            release.set()
+        self.result("done", "active")
+        self.result("done", "mismatch")
+        self.result("done", "valid")
+        self.assertEqual(self.writes, [["one"], ["corrected"], ["two"]])
+        self.assertTrue(self.output.queue.empty())
+
     def test_request_queue_limit_reports_error(self):
         entered, release = threading.Event(), threading.Event()
 
@@ -187,8 +249,8 @@ class WorkerTests(unittest.TestCase):
         self.worker = None
         self.thread = None
 
-    def start(self, pipeline, stream=None):
-        self.worker = Worker(self.output, pipeline, stream or (lambda: Audio(self.writes)))
+    def start(self, pipeline, stream=None, backend="kokoro"):
+        self.worker = Worker(self.output, pipeline, stream or (lambda: Audio(self.writes)), backend=backend)
         self.thread = threading.Thread(target=self.worker.run, args=(self.input,))
         self.thread.start()
         self.assertEqual(self.output.queue.get(timeout=2), {"type": "ready"})
@@ -211,7 +273,7 @@ class WorkerTests(unittest.TestCase):
                 calls.append((text, reference))
                 return [text], 24000
         with patch("worker.cosyvoice_backend.CosyVoiceBackend", Adapter):
-            self.start(lambda _: None, lambda rate: Audio(self.writes))
+            self.start(lambda _: None, lambda rate: Audio(self.writes), backend="cosyvoice3")
             bad = speak("bad")
             bad["config"]["backend"] = "cosyvoice3"
             self.input.send(bad)
@@ -235,7 +297,7 @@ class WorkerTests(unittest.TestCase):
                 release.wait(3)
                 return [text], 24000
         with patch("worker.cosyvoice_backend.CosyVoiceBackend", Adapter):
-            self.start(lambda _: None, lambda rate: Audio(self.writes))
+            self.start(lambda _: None, lambda rate: Audio(self.writes), backend="cosyvoice3")
             request = speak("cancel")
             request["config"].update(backend="cosyvoice3", referenceAudio=os.path.abspath("ref.wav"),
                                      cosyvoiceSource=os.path.abspath("source"), cosyvoiceModel=os.path.abspath("model"))
@@ -455,7 +517,7 @@ class WorkerTests(unittest.TestCase):
             return BlockingAudio(self.writes)
 
         with patch("worker.chatterbox_backend.ChatterboxBackend", FakeBackend):
-            self.start(lambda _: None, stream)
+            self.start(lambda _: None, stream, backend="chatterbox-nano")
             first = speak("first", ("first",))
             second = speak("second", ("second",))
             first["config"]["backend"] = second["config"]["backend"] = "chatterbox-nano"
@@ -620,7 +682,7 @@ class WorkerTests(unittest.TestCase):
                 super().write(samples)
 
         with patch("worker.chatterbox_backend.ChatterboxBackend", FakeBackend):
-            self.start(lambda language: None, lambda rate: BlockingAudio(self.writes))
+            self.start(lambda language: None, lambda rate: BlockingAudio(self.writes), backend="chatterbox-turbo")
             request = speak("overlap", ("first", "second"))
             request["config"]["backend"] = "chatterbox-turbo"
             self.input.send(request)
@@ -654,7 +716,7 @@ class WorkerTests(unittest.TestCase):
 
         audio = BlockingAudio(self.writes)
         with patch("worker.chatterbox_backend.ChatterboxBackend", FakeBackend):
-            self.start(lambda language: None, lambda rate: audio)
+            self.start(lambda language: None, lambda rate: audio, backend="chatterbox-turbo")
             request = speak("cancel-prefetch", ("first", "second"))
             request["config"]["backend"] = "chatterbox-turbo"
             self.input.send(request)
@@ -685,7 +747,7 @@ class WorkerTests(unittest.TestCase):
                 return [text], 24000
 
         with patch("worker.chatterbox_backend.ChatterboxBackend", FakeBackend):
-            self.start(lambda _: None, lambda rate: Audio(self.writes))
+            self.start(lambda _: None, lambda rate: Audio(self.writes), backend="chatterbox-nano")
             first = speak("first", ("first",))
             second = speak("second", ("second",))
             first["config"]["backend"] = second["config"]["backend"] = "chatterbox-nano"
@@ -719,7 +781,7 @@ class WorkerTests(unittest.TestCase):
             rates.append(rate)
             return Audio(self.writes)
         with patch("worker.chatterbox_backend.ChatterboxBackend", FakeBackend):
-            self.start(lambda language: self.fail("Kokoro must not load"), stream)
+            self.start(lambda language: self.fail("Kokoro must not load"), stream, backend="chatterbox-nano")
             request = speak("nano")
             request["config"]["backend"] = "chatterbox-nano"
             self.input.send(request)
@@ -741,7 +803,7 @@ class WorkerTests(unittest.TestCase):
                 context.diagnostic("stale")
                 return np.array([1], dtype=np.float32), 16000
         with patch("worker.chatterbox_backend.ChatterboxBackend", FakeBackend):
-            self.start(lambda language: self.fail("Kokoro must not load"), lambda rate: Audio(self.writes))
+            self.start(lambda language: self.fail("Kokoro must not load"), lambda rate: Audio(self.writes), backend="chatterbox-turbo")
             request = speak("cancelled")
             request["config"]["backend"] = "chatterbox-turbo"
             self.input.send(request)
@@ -758,7 +820,7 @@ class WorkerTests(unittest.TestCase):
         self.start(lambda language: lambda text, **kwargs: [(None, None, [0])])
         for request_id, config, message in (
             ("bad-backend", {"backend": "other"}, "invalid backend"),
-            ("bad-reference", {"backend": "chatterbox-nano", "referenceAudio": "relative.wav"}, "referenceAudio must be an absolute path"),
+            ("bad-reference", {"backend": "kokoro", "referenceAudio": "relative.wav"}, "referenceAudio must be an absolute path"),
         ):
             request = speak(request_id)
             request["config"].update(config)
@@ -779,9 +841,11 @@ class WorkerTests(unittest.TestCase):
             sr = 24000
             tokenizer = staticmethod(lambda text, **kwargs: {"input_ids": list(text)})
             def generate(self, text, audio_prompt_path=None):
-                entered.set()
-                release.wait(3)
-                raise RuntimeError("GPU failed")
+                if text == "one":
+                    entered.set()
+                    release.wait(3)
+                    raise RuntimeError("GPU failed")
+                return np.array([0], dtype=np.float32)
         def load(**kwargs):
             loads.append(kwargs["device"])
             return Model()
@@ -789,7 +853,7 @@ class WorkerTests(unittest.TestCase):
                    "chatterbox": types.ModuleType("chatterbox"),
                    "chatterbox.tts_turbo": types.SimpleNamespace(ChatterboxTurboTTS=types.SimpleNamespace(from_pretrained=load))}
         with patch.dict(sys.modules, modules):
-            self.start(lambda language: lambda text, **kwargs: [(None, None, [0])], lambda rate=24000: Audio(self.writes))
+            self.start(lambda language: lambda text, **kwargs: [(None, None, [0])], lambda rate=24000: Audio(self.writes), backend="chatterbox-nano")
             request = speak("active")
             request["config"]["backend"] = "chatterbox-nano"
             self.input.send(request)
@@ -797,8 +861,11 @@ class WorkerTests(unittest.TestCase):
             self.input.send({"type": "cancel", "id": "active"})
             self.result("cancelled", "active")
             release.set()
-            self.input.send(speak("next"))
+            next_request = speak("next", ("recovery",))
+            next_request["config"]["backend"] = "chatterbox-nano"
+            self.input.send(next_request)
             self.result("done", "next")
             self.assertEqual(loads, ["cuda"])
             np.testing.assert_array_equal(self.writes[0], [0])
+            self.assertEqual(len(self.writes), 1)
             self.assertTrue(self.output.queue.empty())

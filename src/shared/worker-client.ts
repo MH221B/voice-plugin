@@ -6,6 +6,7 @@ type Terminal = Exclude<WorkerResponse, { type: "ready" | "diagnostic" }>;
 type Options = {
   python: string;
   projectRoot: string;
+  backend?: NonNullable<import("./types.js").VoiceConfig["backend"]>;
   log?: boolean;
   onTerminal: (sessionId: string, id: string, response: Terminal) => void;
   onFailure: (message: string) => void;
@@ -25,7 +26,7 @@ export class WorkerClient {
   constructor(private options: Options) {
     if (options.log) this.log = new WorkerLog(options.projectRoot);
     const token = process.env.HF_TOKEN?.trim();
-    this.child = (options.spawn ?? spawn)(options.python, ["-m", "worker.main"], {
+    this.child = (options.spawn ?? spawn)(options.python, ["-m", "worker.main", options.backend ?? "kokoro"], {
       cwd: options.projectRoot,
       stdio: "pipe",
       env: { ...process.env, VOICE_WORKER_LOG: options.log ? "1" : undefined, HF_TOKEN: token || undefined, HF_OIDC_RESOURCE: undefined,

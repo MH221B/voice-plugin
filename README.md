@@ -154,7 +154,7 @@ Only clone a voice with permission. References must be at least one second at 16
 
 The model uses the available PyTorch GPU when supported, while ONNX reference processing may use CPU. The tested AMD 890M setup generated 4.8 seconds of audio in about 48 seconds with a 10-second reference, excluding model load. It emitted attention and MIOpen warnings. Synthesis cannot be interrupted mid-operation, but cancelled audio is suppressed. Kokoro voice, speed, and emotion settings do not affect CosyVoice. Judge the integrated output by listening.
 
-The plugin reads these options at startup and starts one worker. A worker that has loaded CosyVoice refuses a different backend, so restart OpenCode after changing `backend`.
+The plugin reads these options at startup and starts one worker bound to the selected backend. Restart OpenCode after changing `backend`. The worker prepares NumPy and eSpeak at startup; on Windows, only Chatterbox workers preload Chatterbox on the main thread. Model loading and first audio happen after worker readiness.
 
 ## Controls
 

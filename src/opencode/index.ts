@@ -75,7 +75,7 @@ return Plugin.define({
     let lifecycle: ReplyLifecycle | undefined;
     try {
       client = makeClient({ python: backend === "kokoro" ? python : backend === "cosyvoice3" ? cosyvoicePython as string : (chatterboxPython ?? python), projectRoot: root,
-        log: options.log === true,
+        backend, log: options.log === true,
         onTerminal: (session, id, response) => playback.finished(session, id, response),
         onFailure: (message) => { lifecycle?.workerFailed(); toast(message); },
         onDiagnostic: (message) => toast(message),

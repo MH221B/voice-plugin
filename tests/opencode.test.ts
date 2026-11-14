@@ -205,6 +205,7 @@ test("backend configuration selects Python and is sent with speech", async () =>
   const f = fixture({ backend: "chatterbox-nano", chatterboxPython: python, referenceAudio });
   f.commands[0].run();
   assert.equal(f.callbacks()?.python, python);
+  assert.equal(f.callbacks()?.backend, "chatterbox-nano");
   f.setMessages([message()]); f.start(); f.step(); f.success(); await tick();
   const request = f.sent[0];
   assert.equal(request.type, "speak");
@@ -238,6 +239,7 @@ test("CosyVoice requires local paths and selects its own interpreter", async () 
   const f = fixture(options);
   f.commands[0].run();
   assert.equal(f.callbacks()?.python, options.cosyvoicePython);
+  assert.equal(f.callbacks()?.backend, "cosyvoice3");
   f.setMessages([message()]); f.start(); f.step(); f.success(); await tick();
   const request = f.sent[0];
   assert.equal(request.type, "speak");
