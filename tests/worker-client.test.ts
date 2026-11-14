@@ -4,6 +4,7 @@ import { PassThrough, Writable } from "node:stream";
 import { test } from "node:test";
 import type { spawn } from "node:child_process";
 import { WorkerClient } from "../src/shared/worker-client.js";
+import { SessionPlayback } from "../src/shared/session-playback.js";
 import type { WorkerRequest, WorkerResponse } from "../src/shared/types.js";
 
 class FakeChild extends EventEmitter {
@@ -64,6 +65,33 @@ test("buffers until readiness, parses split lines and routes terminal responses 
     ["two", "b", { type: "error", id: "b", message: "device" }]]);
   assert.deepEqual(failures, []);
   client.dispose(); assert.equal(child.killed, true);
+});
+
+test("cancelling queued speech removes it before readiness", () => {
+  const { child, client, terminal, speak } = fixture();
+  client.send(speak("a", "one"));
+  client.send({ type: "cancel", id: "a" });
+  client.send(speak("b", "two"));
+  child.stdout.write('{"type":"ready"}\n');
+  assert.deepEqual(child.writes.map((line) => JSON.parse(line)), [speak("b", "two")]);
+  child.stdout.write('{"type":"done","id":"a"}\n');
+  assert.deepEqual(terminal, []);
+  client.dispose();
+});
+
+test("switching sessions before readiness only sends the new session's speech", () => {
+  const { child, client } = fixture();
+  const playback = new SessionPlayback(client, { voice: "af_heart", speed: 1 }, () => {});
+  playback.setEnabled("a", true);
+  playback.answer({ sessionId: "a", answerId: "1", text: "First." });
+  playback.setEnabled("b", true);
+  playback.answer({ sessionId: "b", answerId: "2", text: "Second." });
+  child.stdout.write('{"type":"ready"}\n');
+  const writes = child.writes.map((line) => JSON.parse(line));
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].type, "speak");
+  assert.equal(writes[0].sessionId, "b");
+  client.dispose();
 });
 
 test("worker uses only a nonblank HF_TOKEN for Hub authentication", () => {

@@ -9,16 +9,20 @@ test("deduplication, replacement and cancellation are session scoped", () => {
   const playback = new SessionPlayback({ send: (request) => { sent.push(request); return true; } },
     { voice: "af_heart", speed: 1 }, (session, message) => errors.push(`${session}: ${message}`));
   const answer = (sessionId: string, answerId: string) => playback.answer({ sessionId, answerId, text: "Hello." });
+  answer("a", "1"); answer("b", "1"); assert.equal(sent.length, 0);
+  playback.setEnabled("a", true);
   answer("a", "1"); answer("a", "1"); answer("b", "1");
-  assert.equal(sent.length, 2);
-  const first = sent[0]; const other = sent[1];
-  assert.equal(first.type, "speak"); assert.equal(other.type, "speak");
+  assert.equal(sent.length, 1);
+  const first = sent[0]; assert.equal(first.type, "speak");
   answer("a", "2");
-  assert.deepEqual(sent[2], { type: "cancel", id: first.id });
-  const replacement = sent[3]; assert.equal(replacement.type, "speak");
+  assert.deepEqual(sent[1], { type: "cancel", id: first.id });
+  const replacement = sent[2]; assert.equal(replacement.type, "speak");
   playback.finished("a", first.id, { type: "error", id: first.id, message: "stale" });
-  playback.stop("a");
-  assert.deepEqual(sent[4], { type: "cancel", id: replacement.id });
+  playback.setEnabled("b", true);
+  assert.deepEqual(sent[3], { type: "cancel", id: replacement.id });
+  assert.equal(playback.status("a"), "OFF");
+  answer("a", "3"); answer("b", "1");
+  const other = sent[4]; assert.equal(other.type, "speak");
   playback.setEnabled("b", false);
   assert.deepEqual(sent[5], { type: "cancel", id: other.id });
   answer("b", "2"); assert.equal(sent.length, 6);
@@ -37,6 +41,7 @@ test("failed acceptance permits retry and empty answers do not speak", () => {
   const playback = new SessionPlayback({ send: (request) => { sent.push(request); return accepts; } },
     { voice: "af_heart", speed: 1 }, () => assert.fail());
   const answer = { sessionId: "a", answerId: "1", text: "Hello" };
+  playback.setEnabled("a", true);
   playback.answer(answer); accepts = true; playback.answer(answer); playback.answer(answer);
   assert.equal(sent.length, 2);
   playback.answer({ sessionId: "b", answerId: "2", text: "```\ncode\n```" });
@@ -50,11 +55,13 @@ test("status follows accepted requests and remains session scoped", () => {
   const playback = new SessionPlayback({ send: (request) => { sent.push(request); return accepts; } },
     { voice: "af_heart", speed: 1 }, () => {}, () => changes++);
   const answer = (answerId: string) => playback.answer({ sessionId: "a", answerId, text: "Hello" });
-  assert.equal(playback.status("a"), "ON");
+  assert.equal(playback.status("a"), "OFF");
+  playback.setEnabled("a", true);
+  changes = 0;
   answer("1"); assert.equal(playback.status("a"), "ON"); assert.equal(changes, 0);
   accepts = true; answer("1");
   const first = sent.at(-1)!;
-  assert.equal(playback.status("a"), "WORKING"); assert.equal(playback.status("b"), "ON");
+  assert.equal(playback.status("a"), "WORKING"); assert.equal(playback.status("b"), "OFF");
   playback.setEnabled("b", false); assert.equal(playback.status("b"), "OFF");
   playback.finished("a", "stale", { type: "done", id: "stale" });
   assert.equal(playback.status("a"), "WORKING");

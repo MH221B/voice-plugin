@@ -49,6 +49,14 @@ export class WorkerClient {
       this.pending.set(request.id, request.sessionId);
     }
     if (!this.ready) {
+      if (request.type === "cancel") {
+        const index = this.queue.findIndex((queued) => queued.type === "speak" && queued.id === request.id);
+        if (index !== -1) {
+          this.queue.splice(index, 1);
+          this.pending.delete(request.id);
+          return true;
+        }
+      }
       this.queue.push(request);
       return true;
     }

@@ -66,6 +66,18 @@ function message(overrides: Partial<Extract<SessionMessageInfo, { type: "assista
 }
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+test("enabled session speaks completed replies while viewing another session", async () => {
+  const f = fixture();
+  f.commands[0].run();
+  f.setMessages([message()]);
+  f.setRoute({ type: "session", sessionID: "other" });
+  f.start(); f.step(); f.success(); await tick();
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].type, "speak");
+  assert.equal(f.sent[0].sessionId, "s");
+  f.cleanup?.();
+});
+
 test("does not speak a completed child session", async () => {
   const f = fixture();
   f.setParent("parent");
@@ -78,6 +90,7 @@ test("does not speak a completed child session", async () => {
 test("resolves missing session metadata and fails closed", async () => {
   for (const outcome of ["root", "child", "missing", "error"] as const) {
     const f = fixture();
+    f.commands[0].run();
     f.setSessionKnown(false);
     f.setSessionSync(async () => {
       if (outcome === "error") throw new Error("unavailable");
@@ -92,6 +105,7 @@ test("resolves missing session metadata and fails closed", async () => {
 
 test("rechecks parent metadata after message sync", async () => {
   const f = fixture();
+  f.commands[0].run();
   f.setMessages([message()]);
   f.setSync(async () => { f.setParent("parent"); });
   f.start(); f.step(); f.success(); await tick();
@@ -103,6 +117,7 @@ test("backend configuration selects Python and is sent with speech", async () =>
   const python = resolve("chatterbox-python");
   const referenceAudio = resolve("reference.wav");
   const f = fixture({ backend: "chatterbox-nano", chatterboxPython: python, referenceAudio });
+  f.commands[0].run();
   assert.equal(f.callbacks()?.python, python);
   f.setMessages([message()]); f.start(); f.step(); f.success(); await tick();
   const request = f.sent[0];
@@ -135,6 +150,7 @@ test("CosyVoice requires local paths and selects its own interpreter", async () 
     assert.equal(bad.callbacks(), undefined);
   }
   const f = fixture(options);
+  f.commands[0].run();
   assert.equal(f.callbacks()?.python, options.cosyvoicePython);
   f.setMessages([message()]); f.start(); f.step(); f.success(); await tick();
   const request = f.sent[0];
@@ -149,6 +165,7 @@ test("CosyVoice requires local paths and selects its own interpreter", async () 
 
 test("selects only the exact final completed answer and deduplicates success", async () => {
   const f = fixture(); f.setMessages([message(), message({ id: "older", content: [{ type: "text", text: "old" }] })]);
+  f.commands[0].run();
   f.success(); await tick(); assert.equal(f.sent.length, 0);
   f.start(); f.step(); f.success(); f.success(); await tick();
   assert.equal(f.sent.length, 1);
@@ -159,6 +176,7 @@ test("selects only the exact final completed answer and deduplicates success", a
 
 test("skips missing, failed, interrupted, retry, ambiguous and non-final answers", async () => {
   const f = fixture();
+  f.commands[0].run();
   for (const messages of [[], [message({ id: "other" })], [message(), message()],
     [message({ finish: "length" })], [message({ time: { created: 1 } })],
     [message({ retry: { attempt: 1, at: 1, error: { type: "unknown", message: "retry" } } })],
@@ -172,10 +190,13 @@ test("skips missing, failed, interrupted, retry, ambiguous and non-final answers
   await tick(); assert.equal(f.sent.length, 0); f.cleanup?.();
 });
 
-test("rechecks route and generation after sync, including later step", async () => {
-  for (const change of [(f: ReturnType<typeof fixture>) => f.setRoute({ type: "home" }),
-    (f: ReturnType<typeof fixture>) => f.start(), (f: ReturnType<typeof fixture>) => f.step("later")]) {
+test("rechecks generation and ownership after sync, including later step", async () => {
+  for (const change of [(f: ReturnType<typeof fixture>) => f.start(), (f: ReturnType<typeof fixture>) => f.step("later"),
+    (f: ReturnType<typeof fixture>) => { f.setRoute({ type: "session", sessionID: "other" }); f.commands[0].run(); },
+    (f: ReturnType<typeof fixture>) => f.commands[1].run(),
+    (f: ReturnType<typeof fixture>) => f.cleanup?.()]) {
     const f = fixture(); f.setMessages([message()]); let resume!: () => void;
+    f.commands[0].run();
     f.setSync(() => new Promise<void>((resolve) => { resume = resolve; }));
     f.start(); f.step(); f.success(); change(f); resume(); await tick();
     assert.equal(f.sent.length, 0); f.cleanup?.();
@@ -184,9 +205,22 @@ test("rechecks route and generation after sync, including later step", async () 
   assert.equal(f.sent.length, 0); f.cleanup?.();
 });
 
+test("navigation during message sync does not suppress enabled session speech", async () => {
+  const f = fixture(); f.commands[0].run(); f.setMessages([message()]);
+  let resume!: () => void;
+  f.setSync(() => new Promise<void>((resolve) => { resume = resolve; }));
+  f.start(); f.step(); f.success();
+  f.setRoute({ type: "home" }); resume(); await tick();
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].type, "speak");
+  f.cleanup?.();
+});
+
 test("commands, configuration and worker notifications", async () => {
   const bad = fixture({ speed: 2 }); assert.deepEqual(bad.toasts, ["Invalid voice plugin configuration"]);
   const f = fixture(); f.setMessages([message()]); f.start(); f.step(); f.success(); await tick();
+  assert.equal(f.sent.length, 0);
+  f.commands[0].run(); f.success(); await tick();
   assert.equal(f.statusSlot()?.append, "prompt.footer.status");
   assert.deepEqual(f.commands.map((c) => [c.id, c.slash?.name]), [["voice.on", "voice-on"], ["voice.off", "voice-off"], ["voice.stop", "voice-stop"]]);
   const first = f.sent[0]; assert.equal(first.type, "speak");
@@ -201,4 +235,36 @@ test("commands, configuration and worker notifications", async () => {
   f.setRoute({ type: "home" }); f.commands[2].run(); assert.equal(f.toasts.at(-1), "Open a session to control voice");
   f.callbacks()?.onFailure("worker failed"); assert.equal(f.toasts.at(-1), "worker failed");
   f.cleanup?.(); assert.equal(f.statusRemoved(), true);
+});
+
+test("enabling a child or unknown session leaves the enabled root playing", async () => {
+  const f = fixture();
+  f.commands[0].run();
+  f.setMessages([message()]); f.start(); f.step(); f.success(); await tick();
+  assert.equal(f.sent.length, 1);
+  f.setRoute({ type: "session", sessionID: "other" });
+  f.setParent("s"); f.commands[0].run();
+  f.setParent(undefined); f.setSessionKnown(false); f.commands[0].run();
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.toasts.length, 2);
+  f.setSessionKnown(true); f.setRoute({ type: "session", sessionID: "s" });
+  f.commands[2].run();
+  assert.equal(f.sent[1].type, "cancel");
+  f.cleanup?.();
+});
+
+test("navigation preserves playback until voice is enabled in another root session", async () => {
+  const f = fixture();
+  f.commands[0].run();
+  f.setMessages([message()]); f.start(); f.step(); f.success(); await tick();
+  const first = f.sent[0];
+  assert.equal(first.type, "speak");
+  f.setRoute({ type: "session", sessionID: "other" });
+  assert.equal(f.sent.length, 1);
+  f.commands[0].run();
+  assert.deepEqual(f.sent[1], { type: "cancel", id: first.id });
+  f.setRoute({ type: "session", sessionID: "s" });
+  f.start(); f.step("later"); f.setMessages([message({ id: "later" })]); f.success(); await tick();
+  assert.equal(f.sent.length, 2);
+  f.cleanup?.();
 });

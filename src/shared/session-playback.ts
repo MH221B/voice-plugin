@@ -16,13 +16,13 @@ export class SessionPlayback {
 
   status(sessionId: string): "ON" | "OFF" | "WORKING" {
     const session = this.sessions.get(sessionId);
-    return session?.enabled === false ? "OFF" : session?.active ? "WORKING" : "ON";
+    return !session?.enabled ? "OFF" : session.active ? "WORKING" : "ON";
   }
 
   private session(id: string): Session {
     let session = this.sessions.get(id);
     if (!session) {
-      session = { enabled: true, answers: new Set() };
+      session = { enabled: false, answers: new Set() };
       this.sessions.set(id, session);
     }
     return session;
@@ -55,6 +55,11 @@ export class SessionPlayback {
   }
 
   setEnabled(sessionId: string, enabled: boolean): void {
+    if (enabled) {
+      for (const [id, other] of this.sessions) {
+        if (id !== sessionId && other.enabled) this.setEnabled(id, false);
+      }
+    }
     const session = this.session(sessionId);
     if (session.enabled !== enabled) {
       session.enabled = enabled;

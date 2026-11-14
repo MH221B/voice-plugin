@@ -117,11 +117,11 @@ These are sound events, not mood controls. The plugin does not expose Chatterbox
 
 ## Controls and emotions
 
-- `/voice-on` enables speech for the current session.
+- `/voice-on` enables speech for the current root session and disables and cancels speech in the previously enabled session.
 - `/voice-off` disables speech and cancels its current request.
 - `/voice-stop` cancels the current request without disabling future speech.
 
-Speech starts enabled in each session. A new answer cancels that session's previous request. In-progress synthesis cannot be forcibly interrupted, but cancelled audio is suppressed.
+Speech starts off in each root session; the footer shows `Voice: OFF`. At most one session per TUI can have voice enabled. Navigating to another session does not stop speech; use `/voice-on` there to switch. Child sessions cannot enable voice. A new answer cancels that session's previous request. In-progress synthesis cannot be forcibly interrupted, but cancelled audio is suppressed.
 
 For optional emotion spans, ask the assistant to use non-nested tags such as:
 

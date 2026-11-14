@@ -95,7 +95,10 @@ return Plugin.define({
       action(session);
     };
     context.keymap.layer(() => ({ mode: "global", commands: [
-      { id: "voice.on", title: "Enable voice", palette: true, slash: { name: "voice-on" }, run: command((id) => playback.setEnabled(id, true)) },
+      { id: "voice.on", title: "Enable voice", palette: true, slash: { name: "voice-on" }, run: command((id) => {
+        if (!isRoot(id)) return toast("Voice can only be enabled for a known root session");
+        playback.setEnabled(id, true);
+      }) },
       { id: "voice.off", title: "Disable voice", palette: true, slash: { name: "voice-off" }, run: command((id) => playback.setEnabled(id, false)) },
       { id: "voice.stop", title: "Stop voice", palette: true, slash: { name: "voice-stop" }, run: command((id) => playback.stop(id)) },
     ] }));
@@ -121,7 +124,7 @@ return Plugin.define({
         const id = data.sessionID;
         const execution = executions.get(id);
         const step = execution?.step;
-        if (!execution || !step || step.finish !== "stop" || current() !== id) return;
+        if (!execution || !step || step.finish !== "stop") return;
         const revision = execution.revision;
         void (async () => {
           try {
@@ -129,7 +132,7 @@ return Plugin.define({
             if (!isRoot(id)) return;
             await context.data.session.message.sync(id);
           } catch { return; }
-          if (disposed || current() !== id || !isRoot(id) || executions.get(id) !== execution || execution.revision !== revision) return;
+          if (disposed || !isRoot(id) || executions.get(id) !== execution || execution.revision !== revision) return;
           const matches = context.data.session.message.list(id).filter((message) => message.id === step.id);
           if (matches.length !== 1) return;
           const message = matches[0];
