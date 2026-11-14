@@ -64,6 +64,24 @@ class Audio:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_worker_stdin_decodes_utf8_protocol(self):
+        script = """
+import json, sys
+from worker import main
+sys.stdin.reconfigure(encoding="cp1252")
+main.prepare_runtime = lambda: None
+def run(self, stream):
+    request = json.loads(stream.readline())
+    self.emit({"type": "diagnostic", "id": request["id"], "message": request["units"][0]["text"]})
+main.Worker.run = run
+main.main()
+"""
+        request = {"id": "synthetic", "units": [{"text": "I’m ready."}]}
+        result = subprocess.run([sys.executable, "-c", script],
+                                input=(json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"),
+                                capture_output=True, timeout=10, check=True)
+        self.assertEqual(json.loads(result.stdout.decode("utf-8"))["message"], "I’m ready.")
+
     def test_caught_exception_tracebacks_are_opt_in_and_stderr_only(self):
         for enabled in (False, True):
             output = Output()
