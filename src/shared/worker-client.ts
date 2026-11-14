@@ -1,10 +1,12 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { WorkerRequest, WorkerResponse } from "./types.js";
+import { WorkerLog } from "./worker-log.js";
 
 type Terminal = Exclude<WorkerResponse, { type: "ready" | "diagnostic" }>;
 type Options = {
   python: string;
   projectRoot: string;
+  log?: boolean;
   onTerminal: (sessionId: string, id: string, response: Terminal) => void;
   onFailure: (message: string) => void;
   onDiagnostic?: (message: string) => void;
@@ -18,13 +20,15 @@ export class WorkerClient {
   private buffer = "";
   private queue: WorkerRequest[] = [];
   private pending = new Map<string, string>();
+  private log?: WorkerLog;
 
   constructor(private options: Options) {
+    if (options.log) this.log = new WorkerLog(options.projectRoot);
     const token = process.env.HF_TOKEN?.trim();
     this.child = (options.spawn ?? spawn)(options.python, ["-m", "worker.main"], {
       cwd: options.projectRoot,
       stdio: "pipe",
-      env: { ...process.env, HF_TOKEN: token || undefined, HF_OIDC_RESOURCE: undefined,
+      env: { ...process.env, VOICE_WORKER_LOG: options.log ? "1" : undefined, HF_TOKEN: token || undefined, HF_OIDC_RESOURCE: undefined,
         HF_HUB_DISABLE_IMPLICIT_TOKEN: token ? "0" : "1" },
     }) as ChildProcessWithoutNullStreams;
     this.child.stdout.setEncoding("utf8");
@@ -34,7 +38,8 @@ export class WorkerClient {
     this.child.on("error", this.onError);
     this.child.on("exit", this.onExit);
     // Drain diagnostics without mixing them into protocol output.
-    this.child.stderr.resume();
+    this.child.stderr.on("data", (chunk: Buffer) => this.log?.write(chunk));
+    this.child.stderr.on("error", () => {});
   }
 
   send(request: WorkerRequest): boolean {
@@ -80,10 +85,12 @@ export class WorkerClient {
         this.queue = [];
         for (const request of queue) if (!this.write(request)) break;
       } else if (value.type === "diagnostic" && typeof value.id === "string" && typeof value.message === "string") {
+        this.log?.write(`Diagnostic ${value.id}: ${value.message}\n`);
         if (this.pending.has(value.id)) this.options.onDiagnostic?.(value.message);
       } else if ((value.type === "done" || value.type === "cancelled") && typeof value.id === "string") {
         this.terminal(value.id, value as Terminal);
       } else if (value.type === "error" && typeof value.message === "string" && (value.id === undefined || typeof value.id === "string")) {
+        this.log?.write(`Request error ${value.id ?? ""}: ${value.message}\n`);
         if (typeof value.id === "string") this.terminal(value.id, value as Terminal);
         else this.fail(`Worker error: ${value.message}`);
       } else {
@@ -104,6 +111,7 @@ export class WorkerClient {
     this.fail(`Worker exited (${signal ?? code ?? "unknown"})`);
 
   private fail(message: string): void {
+    this.log?.write(`${message}\n`);
     if (this.dead) return;
     this.dead = true;
     this.queue = [];

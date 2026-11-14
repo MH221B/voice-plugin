@@ -5,6 +5,7 @@ import sys
 import threading
 
 from worker.delivery import delivery
+from worker.logging_utils import log_exception
 
 
 def pipeline_factory(language):
@@ -77,6 +78,7 @@ class Worker:
                 try:
                     self.stream.abort()
                 except Exception:
+                    log_exception()
                     pass
             self.terminal(request_id, "cancelled")
 
@@ -127,6 +129,7 @@ class Worker:
                 self.pending[request_id] = request
                 self.queue.put(request)
         except (ValueError, TypeError, OverflowError) as exc:
+            log_exception()
             with self.lock:
                 if request_id in self.seen:
                     return
@@ -187,6 +190,7 @@ class Worker:
                 stream.stop()
             self.terminal(request_id, "done")
         except Exception as exc:
+            log_exception()
             self.terminal(request_id, "error", str(exc) or type(exc).__name__)
         finally:
             with self.lock:
@@ -196,6 +200,7 @@ class Worker:
                 try:
                     stream.close()
                 except Exception:
+                    log_exception()
                     pass
 
     def play_chatterbox(self, request):
@@ -243,6 +248,7 @@ class Worker:
                 if stream is not None and not cancelled():
                     stream.stop()
             except Exception as exc:
+                log_exception()
                 errors.append(exc)
                 finished.set()
             finally:
@@ -252,6 +258,7 @@ class Worker:
                     try:
                         stream.close()
                     except Exception:
+                        log_exception()
                         pass
 
         thread = threading.Thread(target=playback)
@@ -283,6 +290,7 @@ class Worker:
                     except queue.Full:
                         continue
         except Exception as exc:
+            log_exception()
             errors.append(exc)
         finally:
             finished.set()
@@ -323,6 +331,7 @@ def main():
     try:
         prepare_runtime()
     except Exception as exc:
+        log_exception()
         protocol_output.write(json.dumps({"type": "error", "message": str(exc) or type(exc).__name__}) + "\n")
         protocol_output.flush()
         return

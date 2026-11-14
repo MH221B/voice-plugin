@@ -17,6 +17,10 @@ return Plugin.define({
   setup(context) {
     const toast = (message: string) => context.ui.toast.show({ message, variant: "error" });
     const options = context.options;
+    if (options.log !== undefined && typeof options.log !== "boolean") {
+      toast("Invalid voice plugin configuration");
+      return;
+    }
     const root = options.projectRoot ?? resolve(dirname(fileURLToPath(import.meta.url)), "../..");
     const python = options.python ?? (typeof root === "string" ? join(root, ".venv", "Scripts", "python.exe") : "");
     const voice = options.voice ?? "af_heart";
@@ -58,6 +62,7 @@ return Plugin.define({
     let client: Client;
     try {
       client = makeClient({ python: backend === "kokoro" ? python : backend === "cosyvoice3" ? cosyvoicePython as string : (chatterboxPython ?? python), projectRoot: root,
+        log: options.log === true,
         onTerminal: (session, id, response) => playback.finished(session, id, response),
         onFailure: (message) => toast(message),
         onDiagnostic: (message) => toast(message),

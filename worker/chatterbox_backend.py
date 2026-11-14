@@ -1,3 +1,4 @@
+from worker.logging_utils import log_exception
 import os
 import sys
 
@@ -58,6 +59,7 @@ class ChatterboxBackend:
         try:
             self.model.conds = conditioning_cache.load(path, reference_hash, self.device, self.module)
         except Exception as exc:
+            log_exception()
             self.check_cancelled()
             if reference_hash is None:
                 raise ValueError(f"Reference audio is missing and no valid matching conditioning cache exists: {reference}") from exc
@@ -116,12 +118,14 @@ class ChatterboxBackend:
             try:
                 gpu = torch.cuda.is_available()
             except Exception as exc:
+                log_exception()
                 self.diagnostic(f"GPU detection failed; retrying on CPU: {exc}")
                 gpu = False
             if gpu:
                 try:
                     self.load("cuda")
                 except Exception as exc:
+                    log_exception()
                     self.check_cancelled()
                     self.diagnostic(f"GPU initialization failed; retrying on CPU: {exc}")
             if self.model is None:
@@ -148,6 +152,7 @@ class ChatterboxBackend:
             self.check_cancelled()
             wav = self.model.generate(text, audio_prompt_path=None)
         except Exception as exc:
+            log_exception()
             self.check_cancelled()
             if self.device != "cuda":
                 raise RuntimeError(f"Chatterbox synthesis failed (check reference audio): {exc}") from exc
@@ -161,6 +166,7 @@ class ChatterboxBackend:
                 self.check_cancelled()
                 wav = self.model.generate(text, audio_prompt_path=None)
             except Exception as cpu_exc:
+                log_exception()
                 raise RuntimeError(f"Chatterbox CPU synthesis failed (check reference audio): {cpu_exc}") from cpu_exc
 
         import numpy as np

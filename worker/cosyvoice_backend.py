@@ -1,6 +1,7 @@
 """Local CosyVoice 3 inference; loaded only in a CosyVoice worker."""
 import hashlib
 import os
+from worker.logging_utils import log_exception
 from pathlib import Path
 import re
 import sys
@@ -95,6 +96,7 @@ class CosyVoiceBackend:
             self.model = model
             self.identity = digest.hexdigest()
         except Exception as exc:
+            log_exception()
             self.check_cancelled()
             raise RuntimeError(f"CosyVoice initialization failed; check local dependencies and model: {exc}") from exc
 
@@ -141,6 +143,7 @@ class CosyVoiceBackend:
             self.speaker_id = speaker_id
             return speaker_id
         except Exception as exc:
+            log_exception()
             self.model.frontend.spk2info.pop(speaker_id, None)
             self.check_cancelled()
             raise ValueError(f"CosyVoice reference audio {reference}: {exc}") from exc
@@ -158,6 +161,7 @@ class CosyVoiceBackend:
             chunks = list(self.model.inference_cross_lingual(
                 PREFIX + re.sub(r"(?<=\w)[‘’](?=\w)", "'", text), "", zero_shot_spk_id=speaker_id, stream=False, text_frontend=False))
         except Exception as exc:
+            log_exception()
             self.check_cancelled()
             raise RuntimeError(f"CosyVoice inference failed: {exc}") from exc
         self.check_cancelled()

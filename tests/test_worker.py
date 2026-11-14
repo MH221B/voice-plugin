@@ -64,6 +64,16 @@ class Audio:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_caught_exception_tracebacks_are_opt_in_and_stderr_only(self):
+        for enabled in (False, True):
+            output = Output()
+            stderr = io.StringIO()
+            with patch.dict(os.environ, {"VOICE_WORKER_LOG": "1" if enabled else "0"}), \
+                 patch("sys.stderr", stderr):
+                Worker(output).receive("not json")
+            self.assertEqual(output.queue.get()["type"], "error")
+            self.assertEqual("Traceback" in stderr.getvalue(), enabled)
+
     def test_bundled_espeak_defaults_and_explicit_overrides(self):
         loader = types.SimpleNamespace(get_library_path=lambda: "bundled/espeak.dll",
                                        get_data_path=lambda: "bundled/espeak-ng-data")
